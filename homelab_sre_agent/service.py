@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import timedelta
 import logging
-from typing import Any
+from typing import Any, Callable
 
 from .config import Config
 from .docker_logs import DockerLogCollector
@@ -61,13 +61,17 @@ class SREService:
         self,
         *,
         config: Config,
-        catalog: ServiceCatalog,
+        catalog: ServiceCatalog | None = None,
+        catalog_loader: Callable[[], ServiceCatalog] | None = None,
         state: StateStore,
         github: GitHubClient,
         logs: DockerLogCollector,
     ) -> None:
         self.config = config
+        if catalog is None and catalog_loader is None:
+            raise ValueError("catalog or catalog_loader is required")
         self.catalog = catalog
+        self.catalog_loader = catalog_loader
         self.state = state
         self.github = github
         self.logs = logs
@@ -75,7 +79,7 @@ class SREService:
     def handle_incident(self, payload: dict[str, Any]) -> dict[str, Any]:
         now = utc_now()
         incident = Incident.from_payload(payload)
-        service = self.catalog.match(container_name=incident.container_name, image=incident.image)
+        service = self._catalog().match(container_name=incident.container_name, image=incident.image)
 
         if not service.sre_enabled:
             return {"ok": True, "status": "ignored", "reason": "sre disabled", "service": service.name}
@@ -180,6 +184,12 @@ class SREService:
             now=now,
         )
         return {"attempted": True, "repo": service.source_repo, "event_type": "homelab-sre-investigate"}
+
+    def _catalog(self) -> ServiceCatalog:
+        if self.catalog_loader is not None:
+            return self.catalog_loader()
+        assert self.catalog is not None
+        return self.catalog
 
 
 def issue_title(service: ServiceMetadata, incident: Incident) -> str:

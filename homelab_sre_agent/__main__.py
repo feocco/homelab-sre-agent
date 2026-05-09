@@ -18,7 +18,6 @@ def main() -> int:
         level=getattr(logging, config.log_level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-    catalog = load_catalog(config.service_metadata_path, default_issue_repo=config.default_issue_repo)
     state = StateStore(config.state_path)
     github = GitHubClient(
         token=config.github_token,
@@ -28,7 +27,7 @@ def main() -> int:
     )
     service = SREService(
         config=config,
-        catalog=catalog,
+        catalog_loader=lambda: load_catalog(config.service_metadata_path, default_issue_repo=config.default_issue_repo),
         state=state,
         github=github,
         logs=DockerLogCollector(),

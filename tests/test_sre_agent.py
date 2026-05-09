@@ -115,6 +115,47 @@ class ServiceTests(TestCase):
         )
         return tmp, service, github
 
+    def test_metadata_can_reload_between_incidents(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name)
+        metadata_path = path / "services.yaml"
+        metadata_path.write_text(
+            """
+services:
+  plant-monitor:
+    containers: [plant-monitor]
+    source:
+      repo: feocco/plant-monitor
+""",
+            encoding="utf-8",
+        )
+        config = make_config(path)
+        github = GitHubClient(token=None, api_url=config.github_api_url, dry_run=True, timeout_seconds=10)
+        service = SREService(
+            config=config,
+            catalog_loader=lambda: load_catalog(metadata_path, default_issue_repo=config.default_issue_repo),
+            state=StateStore(config.state_path),
+            github=github,
+            logs=FakeLogs("ERROR failed"),
+        )
+
+        first = service.handle_incident(payload(fingerprint="first-fingerprint"))
+        metadata_path.write_text(
+            """
+services:
+  plant-monitor:
+    containers: [plant-monitor]
+    source:
+      repo: feocco/hello-nas
+""",
+            encoding="utf-8",
+        )
+        second = service.handle_incident(payload(fingerprint="second-fingerprint"))
+
+        self.assertEqual(first["issue"]["repo"], "feocco/plant-monitor")
+        self.assertEqual(second["issue"]["repo"], "feocco/hello-nas")
+
     def test_unknown_service_creates_homelab_config_issue_without_dispatch(self) -> None:
         tmp, service, github = self.make_service("services: {}\n")
         self.addCleanup(tmp.cleanup)

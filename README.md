@@ -12,7 +12,8 @@ GitHub `repository_dispatch` event.
 
 - Runs on `SERVICE_PORT=8094`.
 - Stores state in SQLite at `SRE_STATE_PATH`.
-- Reads private service metadata from `SRE_SERVICE_METADATA_PATH`.
+- Reads private service metadata from `SRE_SERVICE_METADATA_PATH` on every
+  incident.
 - Starts in `SRE_DRY_RUN=true`, recording intended GitHub actions without
   writing to GitHub.
 - Creates one issue per service/fingerprint.
@@ -52,6 +53,11 @@ configured.
 
 Private deployment metadata belongs in `homelab-config`, not this public app
 repo. See `examples/services.yaml` for the supported shape.
+
+The metadata file is mounted read-only into the container and reloaded for each
+incident. A normal `homelab-config` deploy is enough to update mappings,
+runbook links, and `sre.autofix` choices; the SRE agent does not need a code
+change for metadata-only edits.
 
 ## Codex Autofix
 
