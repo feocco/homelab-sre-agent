@@ -1,0 +1,25 @@
+defaults:
+  issue_repo: feocco/homelab-config
+  deploy_repo: feocco/homelab-config
+
+services:
+  plant-monitor:
+    containers:
+      - plant-monitor
+      - plant-monitor-temporal
+    images:
+      - ghcr.io/feocco/plant-monitor:*
+    source:
+      repo: feocco/plant-monitor
+      path_hint: /Users/feocco/code/plant-monitor
+    issue_repo: feocco/plant-monitor
+    deploy:
+      path: plant-monitor
+    runbook_url: https://github.com/feocco/homelab-config/tree/main/plant-monitor
+    labels:
+      - homelab-sre
+      - plant-monitor
+    sre:
+      enabled: true
+      autofix: false
+      repo_daily_limit: 1
