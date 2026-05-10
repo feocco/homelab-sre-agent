@@ -86,16 +86,25 @@ class StateStore:
             "SELECT * FROM incidents WHERE fingerprint = ?",
             (fingerprint,),
         ).fetchone()
-        if row is None:
-            return None
-        return IncidentRecord(
-            fingerprint=str(row["fingerprint"]),
-            service_name=str(row["service_name"]),
-            issue_repo=str(row["issue_repo"]),
-            issue_number=int(row["issue_number"]) if row["issue_number"] is not None else None,
-            issue_url=str(row["issue_url"]) if row["issue_url"] else None,
-            count=int(row["count"]),
-        )
+        return incident_from_row(row)
+
+    def recent_incident_for_service(
+        self,
+        *,
+        service_name: str,
+        issue_repo: str,
+        since: datetime,
+    ) -> IncidentRecord | None:
+        row = self.connection.execute(
+            """
+            SELECT * FROM incidents
+            WHERE service_name = ? AND issue_repo = ? AND last_seen_at >= ?
+            ORDER BY last_seen_at DESC
+            LIMIT 1
+            """,
+            (service_name, issue_repo, format_dt(since)),
+        ).fetchone()
+        return incident_from_row(row)
 
     def set_issue(self, *, fingerprint: str, issue_number: int, issue_url: str) -> None:
         self.connection.execute(
@@ -130,3 +139,16 @@ class StateStore:
             (source_repo, service_name, fingerprint, format_dt(now)),
         )
         self.connection.commit()
+
+
+def incident_from_row(row: sqlite3.Row | None) -> IncidentRecord | None:
+    if row is None:
+        return None
+    return IncidentRecord(
+        fingerprint=str(row["fingerprint"]),
+        service_name=str(row["service_name"]),
+        issue_repo=str(row["issue_repo"]),
+        issue_number=int(row["issue_number"]) if row["issue_number"] is not None else None,
+        issue_url=str(row["issue_url"]) if row["issue_url"] else None,
+        count=int(row["count"]),
+    )

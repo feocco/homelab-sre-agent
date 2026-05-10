@@ -12,11 +12,15 @@ GitHub `repository_dispatch` event.
 
 - Runs on `SERVICE_PORT=8094`.
 - Stores state in SQLite at `SRE_STATE_PATH`.
+- Stores full local diagnostic bundles under `SRE_DIAGNOSTIC_DIR`; GitHub
+  issues only include a redacted representative line and a local bundle
+  reference.
 - Reads private service metadata from `SRE_SERVICE_METADATA_PATH` on every
   incident.
 - Starts in `SRE_DRY_RUN=true`, recording intended GitHub actions without
   writing to GitHub.
-- Creates one issue per service/fingerprint.
+- Creates one issue per incident episode, so traceback bursts update the same
+  issue instead of creating one issue per matching log line.
 - Keeps Codex dispatch disabled unless service metadata sets `sre.autofix:
   true`.
 
@@ -25,10 +29,15 @@ GitHub `repository_dispatch` event.
 ```text
 SRE_STATE_PATH=/app/state/sre-agent.sqlite3
 SRE_SERVICE_METADATA_PATH=/app/config/services.yaml
+SRE_DIAGNOSTIC_DIR=/app/state/diagnostics
+SRE_DIAGNOSTIC_REFERENCE_ROOT=/app/state/diagnostics
 SRE_INCIDENT_TOKEN=replace_me
 SRE_DEFAULT_ISSUE_REPO=feocco/homelab-config
 SRE_DRY_RUN=true
 SRE_DOCKER_LOG_TAIL=200
+SRE_DOCKER_LOG_LOOKBACK_SECONDS=600
+SRE_EPISODE_WINDOW_SECONDS=120
+SRE_DIAGNOSTIC_MAX_BYTES=1000000
 SRE_INVESTIGATION_COOLDOWN_SECONDS=86400
 SRE_CODEX_GLOBAL_DAILY_LIMIT=3
 SRE_HTTP_TIMEOUT_SECONDS=10
@@ -42,6 +51,11 @@ LOG_LEVEL=INFO
 When `SRE_DRY_RUN=false`, `GITHUB_TOKEN` must have permission to create issues
 in the configured issue repos and dispatch workflows in autofix-enabled source
 repos.
+
+For public issue repos, keep full logs local. Set
+`SRE_DIAGNOSTIC_REFERENCE_ROOT` to the NAS host path for the mounted state
+directory, for example
+`/volume1/docker/homelab-config/homelab-sre-agent/data/diagnostics`.
 
 ## Incident API
 

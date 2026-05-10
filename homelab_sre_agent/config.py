@@ -9,12 +9,17 @@ from pathlib import Path
 class Config:
     state_path: Path
     service_metadata_path: Path
+    diagnostic_dir: Path
+    diagnostic_reference_root: str
     incident_token: str | None
     github_token: str | None
     github_api_url: str
     default_issue_repo: str
     dry_run: bool
     docker_log_tail: int
+    docker_log_lookback_seconds: int
+    episode_window_seconds: int
+    diagnostic_max_bytes: int
     investigation_cooldown_seconds: int
     codex_global_daily_limit: int
     service_host: str
@@ -24,15 +29,22 @@ class Config:
 
     @classmethod
     def from_env(cls) -> "Config":
+        state_path = Path(os.environ.get("SRE_STATE_PATH", "/app/state/sre-agent.sqlite3"))
+        diagnostic_dir = Path(os.environ.get("SRE_DIAGNOSTIC_DIR", str(state_path.parent / "diagnostics")))
         return cls(
-            state_path=Path(os.environ.get("SRE_STATE_PATH", "/app/state/sre-agent.sqlite3")),
+            state_path=state_path,
             service_metadata_path=Path(os.environ.get("SRE_SERVICE_METADATA_PATH", "/app/config/services.yaml")),
+            diagnostic_dir=diagnostic_dir,
+            diagnostic_reference_root=os.environ.get("SRE_DIAGNOSTIC_REFERENCE_ROOT", str(diagnostic_dir)),
             incident_token=optional(os.environ.get("SRE_INCIDENT_TOKEN")),
             github_token=optional(os.environ.get("GITHUB_TOKEN")),
             github_api_url=os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/"),
             default_issue_repo=os.environ.get("SRE_DEFAULT_ISSUE_REPO", "feocco/homelab-config"),
             dry_run=parse_bool(os.environ.get("SRE_DRY_RUN"), True),
             docker_log_tail=parse_int("SRE_DOCKER_LOG_TAIL", 200),
+            docker_log_lookback_seconds=parse_int("SRE_DOCKER_LOG_LOOKBACK_SECONDS", 600),
+            episode_window_seconds=parse_int("SRE_EPISODE_WINDOW_SECONDS", 120),
+            diagnostic_max_bytes=parse_int("SRE_DIAGNOSTIC_MAX_BYTES", 1_000_000),
             investigation_cooldown_seconds=parse_int("SRE_INVESTIGATION_COOLDOWN_SECONDS", 86400),
             codex_global_daily_limit=parse_int("SRE_CODEX_GLOBAL_DAILY_LIMIT", 3),
             service_host=os.environ.get("SERVICE_HOST", "0.0.0.0"),

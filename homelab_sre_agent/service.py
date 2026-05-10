@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
+import hashlib
 import logging
+import re
+from pathlib import Path
 from typing import Any, Callable
 
 from .config import Config
@@ -14,8 +17,8 @@ from .state import StateStore, utc_now
 
 
 LOGGER = logging.getLogger("homelab-sre-agent")
-MAX_ISSUE_LOG_CHARS = 8000
-MAX_COMMENT_LOG_CHARS = 4000
+MAX_PUBLIC_LINE_CHARS = 1000
+EXCEPTION_RE = re.compile(r"\b([A-Za-z_][\w.]*Error|Exception):\s+(.+)")
 
 
 @dataclass(frozen=True)
@@ -56,6 +59,20 @@ class Incident:
         )
 
 
+@dataclass(frozen=True)
+class DiagnosticBundle:
+    path: str
+    reference: str
+
+
+@dataclass(frozen=True)
+class IssueAnalysis:
+    summary: str
+    observed: str
+    expected: str
+    representative_line: str
+
+
 class SREService:
     def __init__(
         self,
@@ -84,26 +101,28 @@ class SREService:
         if not service.sre_enabled:
             return {"ok": True, "status": "ignored", "reason": "sre disabled", "service": service.name}
 
-        raw_logs = self._collect_logs(incident)
-        sanitized_line = redact_text(incident.line, limit=2000)
-        sanitized_logs = redact_text(raw_logs, limit=MAX_ISSUE_LOG_CHARS)
+        raw_logs = self._collect_logs(service, incident, now)
+        bundle = self._write_diagnostic_bundle(service, incident, raw_logs, now)
+        analysis = analyze_incident(incident, raw_logs)
+        sanitized_line = redact_text(analysis.representative_line, limit=MAX_PUBLIC_LINE_CHARS)
+        state_key = self._state_key(service, incident, raw_logs, now)
         record = self.state.record_seen(
-            fingerprint=incident.fingerprint,
+            fingerprint=state_key,
             service_name=service.name,
             issue_repo=service.issue_repo,
             now=now,
         )
 
-        title = issue_title(service, incident)
+        title = issue_title(service, incident, state_key)
         labels = sorted(set(service.labels + ("homelab-sre", incident.severity.lower())))
         if record.issue_number is None:
             issue = self.github.create_issue(
                 repo=service.issue_repo,
                 title=title,
-                body=issue_body(service, incident, sanitized_line, sanitized_logs, self.config.dry_run),
+                body=issue_body(service, incident, analysis, sanitized_line, bundle, self.config.dry_run),
                 labels=labels,
             )
-            self.state.set_issue(fingerprint=incident.fingerprint, issue_number=issue.number, issue_url=issue.url)
+            self.state.set_issue(fingerprint=state_key, issue_number=issue.number, issue_url=issue.url)
             issue_result = issue
             issue_action = "created"
         else:
@@ -115,11 +134,11 @@ class SREService:
             self.github.comment_issue(
                 repo=service.issue_repo,
                 issue_number=record.issue_number,
-                body=issue_comment(incident, sanitized_line, redact_text(raw_logs, limit=MAX_COMMENT_LOG_CHARS)),
+                body=issue_comment(incident, sanitized_line, bundle),
             )
             issue_action = "updated"
 
-        dispatch = self._maybe_dispatch_codex(service, incident, issue_result, now)
+        dispatch = self._maybe_dispatch_codex(service, incident, issue_result, state_key, now)
         LOGGER.info("%s issue for %s fingerprint=%s", issue_action, service.name, incident.fingerprint[:12])
         return {
             "ok": True,
@@ -127,26 +146,87 @@ class SREService:
             "service": service.name,
             "issue": {"repo": issue_result.repo, "number": issue_result.number, "url": issue_result.url},
             "dispatch": dispatch,
+            "diagnostic": {"path": bundle.path, "reference": bundle.reference},
             "dry_run": self.config.dry_run,
         }
 
-    def _collect_logs(self, incident: Incident) -> str:
+    def _collect_logs(self, service: ServiceMetadata, incident: Incident, now: datetime) -> str:
         try:
-            return self.logs.collect(
-                container_id=incident.container_id,
-                container_name=incident.container_name,
+            return self.logs.collect_many(
+                container_names=service.containers,
+                incident_container_id=incident.container_id,
+                incident_container_name=incident.container_name,
                 tail=self.config.docker_log_tail,
+                since=now - timedelta(seconds=self.config.docker_log_lookback_seconds),
             )
         except Exception as exc:
             LOGGER.warning("Could not collect Docker logs for %s: %s", incident.container_name, exc)
             return f"Could not collect Docker logs: {exc}"
+
+    def _write_diagnostic_bundle(
+        self,
+        service: ServiceMetadata,
+        incident: Incident,
+        raw_logs: str,
+        now: datetime,
+    ) -> DiagnosticBundle:
+        stamp = now.strftime("%Y%m%dT%H%M%SZ")
+        target_dir = self.config.diagnostic_dir / safe_segment(service.name)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        path = target_dir / f"{stamp}-{incident.fingerprint[:12]}.log"
+        text = "\n".join(
+            [
+                f"service={service.name}",
+                f"container={incident.container_name}",
+                f"image={incident.image}",
+                f"severity={incident.severity}",
+                f"fingerprint={incident.fingerprint}",
+                f"occurred_at={incident.occurred_at}",
+                f"detected_at={incident.detected_at}",
+                f"log_lookback_seconds={self.config.docker_log_lookback_seconds}",
+                "",
+                raw_logs,
+            ]
+        )
+        path.write_text(limit_bytes(text, self.config.diagnostic_max_bytes), encoding="utf-8")
+        return DiagnosticBundle(path=str(path), reference=self._diagnostic_reference(path))
+
+    def _diagnostic_reference(self, path: Path) -> str:
+        try:
+            relative = path.relative_to(self.config.diagnostic_dir)
+        except ValueError:
+            return str(path)
+        return f"{self.config.diagnostic_reference_root.rstrip('/')}/{relative}"
+
+    def _state_key(self, service: ServiceMetadata, incident: Incident, raw_logs: str, now: datetime) -> str:
+        if self.config.episode_window_seconds > 0:
+            recent = self.state.recent_incident_for_service(
+                service_name=service.name,
+                issue_repo=service.issue_repo,
+                since=now - timedelta(seconds=self.config.episode_window_seconds),
+            )
+            if recent is not None and recent.issue_number is not None:
+                return recent.fingerprint
+
+        analysis = analyze_incident(incident, raw_logs)
+        signature = "|".join(
+            [
+                service.name,
+                incident.container_name,
+                incident.severity,
+                normalize_for_key(analysis.representative_line),
+            ]
+        )
+        digest = hashlib.sha256(signature.encode("utf-8")).hexdigest()
+        return f"episode:{service.name}:{digest}"
 
     def _maybe_dispatch_codex(
         self,
         service: ServiceMetadata,
         incident: Incident,
         issue: IssueResult,
-        now,
+        state_key: str,
+        now: datetime,
     ) -> dict[str, Any]:
         if service.unknown:
             return {"attempted": False, "reason": "unknown service"}
@@ -155,7 +235,7 @@ class SREService:
         if not service.source_repo:
             return {"attempted": False, "reason": "source repo missing"}
         cooldown_since = now - timedelta(seconds=self.config.investigation_cooldown_seconds)
-        if self.state.recent_dispatch_exists(fingerprint=incident.fingerprint, since=cooldown_since):
+        if self.state.recent_dispatch_exists(fingerprint=state_key, since=cooldown_since):
             return {"attempted": False, "reason": "investigation cooldown"}
         day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         if self.state.dispatch_count(source_repo=service.source_repo, since=day_start) >= service.repo_daily_limit:
@@ -180,7 +260,7 @@ class SREService:
         self.state.record_dispatch(
             source_repo=service.source_repo,
             service_name=service.name,
-            fingerprint=incident.fingerprint,
+            fingerprint=state_key,
             now=now,
         )
         return {"attempted": True, "repo": service.source_repo, "event_type": "homelab-sre-investigate"}
@@ -192,22 +272,34 @@ class SREService:
         return self.catalog
 
 
-def issue_title(service: ServiceMetadata, incident: Incident) -> str:
-    return f"[homelab-sre] {service.name} {incident.severity} {incident.fingerprint[:12]}"
+def issue_title(service: ServiceMetadata, incident: Incident, state_key: str) -> str:
+    digest = hashlib.sha256(state_key.encode("utf-8")).hexdigest()[:12]
+    return f"[homelab-sre] {service.name} {incident.severity} {digest}"
 
 
 def issue_body(
     service: ServiceMetadata,
     incident: Incident,
+    analysis: IssueAnalysis,
     sanitized_line: str,
-    sanitized_logs: str,
+    bundle: DiagnosticBundle,
     dry_run: bool,
 ) -> str:
     return "\n".join(
         [
             "## Summary",
             "",
-            f"`{incident.container_name}` emitted a `{incident.severity}` log line matched by `{incident.matched_pattern}`.",
+            analysis.summary,
+            "",
+            "## Observed",
+            "",
+            f"- {redact_text(analysis.observed, limit=MAX_PUBLIC_LINE_CHARS)}",
+            f"- Relevant redacted log line: `{sanitized_line}`",
+            f"- Full local diagnostic bundle: `{bundle.reference}`",
+            "",
+            "## Expected",
+            "",
+            f"- {analysis.expected}",
             "",
             "## Incident",
             "",
@@ -215,7 +307,7 @@ def issue_body(
             f"- Occurred at: `{incident.occurred_at}`",
             f"- Detected at: `{incident.detected_at}`",
             f"- Image: `{incident.image}`",
-            f"- Message: `{sanitized_line}`",
+            f"- Matched pattern: `{incident.matched_pattern}`",
             "",
             "## Deployment Metadata",
             "",
@@ -228,33 +320,80 @@ def issue_body(
             f"- Codex autofix: `{service.autofix}`",
             f"- SRE dry run: `{dry_run}`",
             "",
-            "## Recent Logs",
-            "",
-            "```text",
-            sanitized_logs,
-            "```",
-            "",
             "## Expected Fix Discipline",
             "",
+            "Start from this incident summary and use targeted code search. Do not scan the whole repo unless the evidence requires it.",
             "Keep fixes narrowly scoped to the failure. Prefer a small PR with tests or a clear validation note.",
         ]
     )
 
 
-def issue_comment(incident: Incident, sanitized_line: str, sanitized_logs: str) -> str:
+def issue_comment(incident: Incident, sanitized_line: str, bundle: DiagnosticBundle) -> str:
     return "\n".join(
         [
-            "The same fingerprint was observed again.",
+            "The same incident episode was observed again.",
             "",
             f"- Occurred at: `{incident.occurred_at}`",
             f"- Detected at: `{incident.detected_at}`",
-            f"- Message: `{sanitized_line}`",
-            "",
-            "```text",
-            sanitized_logs,
-            "```",
+            f"- Relevant redacted log line: `{sanitized_line}`",
+            f"- Full local diagnostic bundle: `{bundle.reference}`",
         ]
     )
+
+
+def analyze_incident(incident: Incident, raw_logs: str) -> IssueAnalysis:
+    representative = representative_log_line(incident, raw_logs)
+    clean = strip_log_timestamp(representative)
+    exception = EXCEPTION_RE.search(clean)
+    if exception:
+        exception_type = exception.group(1)
+        exception_message = exception.group(2).strip()
+        return IssueAnalysis(
+            summary=f"`{incident.container_name}` hit `{exception_type}` near a `{incident.severity}` log event.",
+            observed=f"The service raised `{exception_type}`: {exception_message}",
+            expected="The service should handle the request without raising an exception or emitting an error log.",
+            representative_line=representative,
+        )
+    return IssueAnalysis(
+        summary=f"`{incident.container_name}` emitted a `{incident.severity}` log event matched by `{incident.matched_pattern}`.",
+        observed=f"The service logged: {clean}",
+        expected="The service should run without unexpected ERROR/WARN log events.",
+        representative_line=representative,
+    )
+
+
+def representative_log_line(incident: Incident, raw_logs: str) -> str:
+    for line in reversed(raw_logs.splitlines()):
+        if EXCEPTION_RE.search(line):
+            return line.strip()
+    for line in raw_logs.splitlines():
+        if incident.severity and incident.severity.upper() in line.upper():
+            return line.strip()
+    return incident.line.strip() or incident.normalized_line.strip() or "No representative log line captured."
+
+
+def strip_log_timestamp(line: str) -> str:
+    parts = line.split(maxsplit=1)
+    if len(parts) == 2 and "T" in parts[0] and ":" in parts[0]:
+        return parts[1].strip()
+    return line.strip()
+
+
+def normalize_for_key(value: str) -> str:
+    return re.sub(r"\s+", " ", strip_log_timestamp(value)).strip().lower()
+
+
+def limit_bytes(value: str, max_bytes: int) -> str:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    suffix = encoded[-max_bytes:].decode("utf-8", errors="replace")
+    return f"<truncated to last {max_bytes} bytes>\n{suffix}"
+
+
+def safe_segment(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip(".-")
+    return cleaned or "unknown"
 
 
 def optional_str(value: Any) -> str | None:

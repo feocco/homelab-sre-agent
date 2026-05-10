@@ -20,6 +20,8 @@ jobs:
         uses: openai/codex-action@v1
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          model: gpt-5.5
+          effort: medium
           safety-strategy: drop-sudo
           sandbox: workspace-write
           prompt: |
@@ -34,6 +36,8 @@ jobs:
             - Deployment path: ${{ github.event.client_payload.deployment_path }}
 
             Requirements:
+            - Start from the SRE context and use targeted code search.
+            - Do not scan the whole repo unless the evidence requires it.
             - Inspect the relevant code and tests.
             - Make the smallest plausible fix.
             - Add or update focused tests when possible.
