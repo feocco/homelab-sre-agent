@@ -6,10 +6,10 @@ from unittest import TestCase
 
 from homelab_sre_agent.config import Config
 from homelab_sre_agent.docker_logs import DockerLogCollector
-from homelab_sre_agent.github import GitHubClient
+from homelab_sre_agent.github import GitHubClient, GitHubIssue, IssueResult
 from homelab_sre_agent.metadata import load_catalog
 from homelab_sre_agent.redact import redact_text
-from homelab_sre_agent.service import SREService
+from homelab_sre_agent.service import AUTOFIX_APPROVED_LABEL, AUTOFIX_PENDING_LABEL, AUTOFIX_STARTED_LABEL, SREService
 from homelab_sre_agent.state import StateStore
 
 
@@ -27,6 +27,59 @@ class FakeLogs(DockerLogCollector):
         since=None,
     ) -> str:
         return self.text
+
+
+class FakeGitHub(GitHubClient):
+    def __init__(self) -> None:
+        super().__init__(token=None, api_url="https://api.github.com", dry_run=True, timeout_seconds=10)
+        self.next_issue_number = 2
+        self.issues: dict[tuple[str, int], GitHubIssue] = {}
+
+    def create_issue(self, *, repo: str, title: str, body: str, labels: list[str]) -> IssueResult:
+        issue = GitHubIssue(
+            repo=repo,
+            number=self.next_issue_number,
+            url=f"https://github.com/{repo}/issues/{self.next_issue_number}",
+            title=title,
+            labels=tuple(labels),
+        )
+        self.next_issue_number += 1
+        self.issues[(repo, issue.number)] = issue
+        self.dry_run_actions.append(
+            {"action": "create_issue", "repo": repo, "title": title, "body": body, "labels": labels}
+        )
+        return IssueResult(repo=repo, number=issue.number, url=issue.url)
+
+    def list_open_issues_with_label(self, *, repo: str, label: str) -> list[GitHubIssue]:
+        return [issue for issue in self.issues.values() if issue.repo == repo and label in issue.labels]
+
+    def add_issue_labels(self, *, repo: str, issue_number: int, labels: list[str]) -> None:
+        key = (repo, issue_number)
+        issue = self.issues[key]
+        self.issues[key] = GitHubIssue(
+            repo=issue.repo,
+            number=issue.number,
+            url=issue.url,
+            title=issue.title,
+            labels=tuple(sorted(set(issue.labels).union(labels))),
+        )
+        self.dry_run_actions.append(
+            {"action": "add_issue_labels", "repo": repo, "issue_number": issue_number, "labels": labels}
+        )
+
+    def remove_issue_label(self, *, repo: str, issue_number: int, label: str) -> None:
+        key = (repo, issue_number)
+        issue = self.issues[key]
+        self.issues[key] = GitHubIssue(
+            repo=issue.repo,
+            number=issue.number,
+            url=issue.url,
+            title=issue.title,
+            labels=tuple(item for item in issue.labels if item != label),
+        )
+        self.dry_run_actions.append(
+            {"action": "remove_issue_label", "repo": repo, "issue_number": issue_number, "label": label}
+        )
 
 
 def make_config(
@@ -52,6 +105,7 @@ def make_config(
         diagnostic_max_bytes=1_000_000,
         investigation_cooldown_seconds=investigation_cooldown_seconds,
         codex_global_daily_limit=3,
+        approval_poll_seconds=300,
         service_host="127.0.0.1",
         service_port=8094,
         http_timeout_seconds=10,
@@ -125,6 +179,7 @@ class ServiceTests(TestCase):
         logs: str = "ERROR token=abc failed",
         episode_window_seconds: int = 120,
         investigation_cooldown_seconds: int = 86400,
+        github: GitHubClient | None = None,
     ):
         tmp = tempfile.TemporaryDirectory()
         path = Path(tmp.name)
@@ -135,7 +190,7 @@ class ServiceTests(TestCase):
             investigation_cooldown_seconds=investigation_cooldown_seconds,
         )
         catalog = load_catalog(config.service_metadata_path, default_issue_repo=config.default_issue_repo)
-        github = GitHubClient(token=None, api_url=config.github_api_url, dry_run=True, timeout_seconds=10)
+        github = github or GitHubClient(token=None, api_url=config.github_api_url, dry_run=True, timeout_seconds=10)
         service = SREService(
             config=config,
             catalog=catalog,
@@ -213,7 +268,8 @@ services:
 
         self.assertEqual([action["action"] for action in github.dry_run_actions], ["create_issue", "comment_issue"])
 
-    def test_autofix_dispatch_obeys_repo_daily_limit(self) -> None:
+    def test_autofix_requires_approval_and_poll_dispatches(self) -> None:
+        github = FakeGitHub()
         tmp, service, github = self.make_service(
             """
 services:
@@ -227,6 +283,42 @@ services:
 """,
             episode_window_seconds=0,
             investigation_cooldown_seconds=0,
+            github=github,
+        )
+        self.addCleanup(tmp.cleanup)
+
+        result = service.handle_incident(payload(fingerprint="fingerprint-one"))
+        issue_key = ("feocco/plant-monitor", result["issue"]["number"])
+
+        self.assertEqual(result["dispatch"]["reason"], "autofix approval required")
+        self.assertIn(AUTOFIX_PENDING_LABEL, github.issues[issue_key].labels)
+        self.assertNotIn("repository_dispatch", [action["action"] for action in github.dry_run_actions])
+
+        github.add_issue_labels(repo=issue_key[0], issue_number=issue_key[1], labels=[AUTOFIX_APPROVED_LABEL])
+        poll_result = service.poll_autofix_approvals()
+
+        self.assertEqual(poll_result["processed"], 1)
+        self.assertIn("repository_dispatch", [action["action"] for action in github.dry_run_actions])
+        self.assertIn(AUTOFIX_STARTED_LABEL, github.issues[issue_key].labels)
+        self.assertNotIn(AUTOFIX_APPROVED_LABEL, github.issues[issue_key].labels)
+        self.assertNotIn(AUTOFIX_PENDING_LABEL, github.issues[issue_key].labels)
+
+    def test_approved_autofix_obeys_repo_daily_limit(self) -> None:
+        github = FakeGitHub()
+        tmp, service, github = self.make_service(
+            """
+services:
+  plant-monitor:
+    containers: [plant-monitor]
+    source:
+      repo: feocco/plant-monitor
+    sre:
+      autofix: true
+      repo_daily_limit: 1
+""",
+            episode_window_seconds=0,
+            investigation_cooldown_seconds=0,
+            github=github,
         )
         self.addCleanup(tmp.cleanup)
 
@@ -236,13 +328,20 @@ services:
         second_payload["incident"]["matched_pattern"] = "WARN"
         second_payload["incident"]["line"] = "WARN another failure"
         second = service.handle_incident(second_payload)
+        first_issue_key = ("feocco/plant-monitor", first["issue"]["number"])
+        second_issue_key = ("feocco/plant-monitor", second["issue"]["number"])
 
-        self.assertTrue(first["dispatch"]["attempted"])
-        self.assertEqual(second["dispatch"]["reason"], "repo daily limit")
-        self.assertEqual(
-            [action["action"] for action in github.dry_run_actions],
-            ["create_issue", "repository_dispatch", "create_issue"],
+        github.add_issue_labels(repo=first_issue_key[0], issue_number=first_issue_key[1], labels=[AUTOFIX_APPROVED_LABEL])
+        service.poll_autofix_approvals()
+        github.add_issue_labels(
+            repo=second_issue_key[0],
+            issue_number=second_issue_key[1],
+            labels=[AUTOFIX_APPROVED_LABEL],
         )
+        poll_result = service.poll_autofix_approvals()
+
+        self.assertEqual(poll_result["results"][0]["status"], "blocked")
+        self.assertEqual(poll_result["results"][0]["reason"], "repo daily limit")
 
     def test_issue_body_uses_summary_and_local_diagnostic_reference(self) -> None:
         tmp, service, github = self.make_service(

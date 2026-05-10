@@ -22,7 +22,8 @@ GitHub `repository_dispatch` event.
 - Creates one issue per incident episode, so traceback bursts update the same
   issue instead of creating one issue per matching log line.
 - Keeps Codex dispatch disabled unless service metadata sets `sre.autofix:
-  true`.
+  true` and an issue receives the `sre:autofix-approved` label.
+- Polls GitHub for approved SRE issues every `SRE_APPROVAL_POLL_SECONDS`.
 
 ## Configuration
 
@@ -40,6 +41,7 @@ SRE_EPISODE_WINDOW_SECONDS=120
 SRE_DIAGNOSTIC_MAX_BYTES=1000000
 SRE_INVESTIGATION_COOLDOWN_SECONDS=86400
 SRE_CODEX_GLOBAL_DAILY_LIMIT=3
+SRE_APPROVAL_POLL_SECONDS=300
 SRE_HTTP_TIMEOUT_SECONDS=10
 GITHUB_TOKEN=replace_me
 GITHUB_API_URL=https://api.github.com
@@ -75,10 +77,31 @@ change for metadata-only edits.
 
 ## Codex Autofix
 
-Autofix is disabled by default. For a service with `sre.autofix: true`, the SRE
-agent sends a `repository_dispatch` event named `homelab-sre-investigate` to the
-source repo. The target repo should include a workflow like
-`examples/homelab-sre-investigate.yml`, backed by an `OPENAI_API_KEY` secret.
+Autofix is disabled by default. For a service with `sre.autofix: true`, new
+issues are labeled `sre:autofix-pending`. The SRE agent polls GitHub for
+`sre:autofix-approved` on open `homelab-sre` issues. When it finds approval, it
+checks local incident state, cooldowns, daily limits, and open SRE PRs before
+sending a `repository_dispatch` event named `homelab-sre-investigate` to the
+source repo.
+
+This keeps GitHub from needing network access to the NAS. Approval happens in
+GitHub, but the NAS-hosted SRE agent polls GitHub outbound and remains the
+gatekeeper.
+
+Useful labels:
+
+- `sre:autofix-pending`: code fix is available but waiting for approval.
+- `sre:autofix-approved`: approve one Codex dispatch.
+- `sre:autofix-started`: SRE agent accepted approval and dispatched Codex, or
+  found an existing SRE PR/dispatch.
+- `sre:autofix-blocked`: SRE agent could not dispatch because a safety gate
+  failed.
+- `sre:human-investigating`: leave approval in place but do not dispatch while
+  a person is working.
+
+The target repo should include a workflow like
+`examples/homelab-sre-investigate.yml`, backed by an `OPENAI_API_KEY` secret and
+a token that can create draft PRs.
 
 The workflow should create a draft PR only. Human review remains the deployment
 gate.

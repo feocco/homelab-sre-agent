@@ -21,5 +21,7 @@ services:
       - plant-monitor
     sre:
       enabled: true
+      # Eligible for approved autofix. The SRE agent still waits for the
+      # sre:autofix-approved issue label before dispatching Codex.
       autofix: false
       repo_daily_limit: 1

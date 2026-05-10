@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import sys
+import threading
+import time
 
 from .config import Config
 from .docker_logs import DockerLogCollector
@@ -32,8 +34,31 @@ def main() -> int:
         github=github,
         logs=DockerLogCollector(),
     )
+    start_approval_poller(config, service)
     SREServer(config=config, service=service).serve_forever()
     return 0
+
+
+def start_approval_poller(config: Config, service: SREService) -> None:
+    if config.approval_poll_seconds <= 0:
+        logging.getLogger("homelab-sre-agent.approvals").info("Autofix approval polling disabled")
+        return
+
+    logger = logging.getLogger("homelab-sre-agent.approvals")
+
+    def poll_forever() -> None:
+        while True:
+            try:
+                result = service.poll_autofix_approvals()
+                if result["processed"]:
+                    logger.info("Autofix approval poll result: %s", result)
+            except Exception:
+                logger.exception("Autofix approval poll failed")
+            time.sleep(config.approval_poll_seconds)
+
+    thread = threading.Thread(target=poll_forever, name="sre-autofix-approvals", daemon=True)
+    thread.start()
+    logger.info("Autofix approval polling every %s seconds", config.approval_poll_seconds)
 
 
 if __name__ == "__main__":

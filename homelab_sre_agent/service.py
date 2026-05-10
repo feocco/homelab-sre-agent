@@ -10,7 +10,7 @@ from typing import Any, Callable
 
 from .config import Config
 from .docker_logs import DockerLogCollector
-from .github import GitHubClient, IssueResult
+from .github import GitHubClient, GitHubIssue, IssueResult
 from .metadata import ServiceCatalog, ServiceMetadata
 from .redact import redact_text
 from .state import StateStore, utc_now
@@ -19,6 +19,19 @@ from .state import StateStore, utc_now
 LOGGER = logging.getLogger("homelab-sre-agent")
 MAX_PUBLIC_LINE_CHARS = 1000
 EXCEPTION_RE = re.compile(r"\b([A-Za-z_][\w.]*Error|Exception):\s+(.+)")
+AUTOFIX_PENDING_LABEL = "sre:autofix-pending"
+AUTOFIX_APPROVED_LABEL = "sre:autofix-approved"
+AUTOFIX_STARTED_LABEL = "sre:autofix-started"
+AUTOFIX_BLOCKED_LABEL = "sre:autofix-blocked"
+HUMAN_INVESTIGATING_LABEL = "sre:human-investigating"
+SRE_LABEL = "homelab-sre"
+AUTOFIX_LABELS = {
+    AUTOFIX_PENDING_LABEL: ("fef3c7", "SRE autofix is available but waiting for approval."),
+    AUTOFIX_APPROVED_LABEL: ("bbf7d0", "Approval for the homelab SRE agent to dispatch Codex."),
+    AUTOFIX_STARTED_LABEL: ("bfdbfe", "The homelab SRE agent dispatched Codex for this issue."),
+    AUTOFIX_BLOCKED_LABEL: ("fecaca", "The homelab SRE agent could not dispatch Codex for this issue."),
+    HUMAN_INVESTIGATING_LABEL: ("ddd6fe", "A human is investigating; SRE autofix should not start."),
+}
 
 
 @dataclass(frozen=True)
@@ -114,8 +127,9 @@ class SREService:
         )
 
         title = issue_title(service, incident, state_key)
-        labels = sorted(set(service.labels + ("homelab-sre", incident.severity.lower())))
+        labels = sorted(set(service.labels + (SRE_LABEL, incident.severity.lower()) + self._autofix_pending_labels(service)))
         if record.issue_number is None:
+            self._ensure_labels(service.issue_repo, labels)
             issue = self.github.create_issue(
                 repo=service.issue_repo,
                 title=title,
@@ -136,9 +150,20 @@ class SREService:
                 issue_number=record.issue_number,
                 body=issue_comment(incident, sanitized_line, bundle),
             )
+            pending_labels = self._autofix_pending_labels(service)
+            if pending_labels and not self.state.recent_dispatch_exists(
+                fingerprint=state_key,
+                since=now - timedelta(seconds=self.config.investigation_cooldown_seconds),
+            ):
+                self._ensure_labels(service.issue_repo, pending_labels)
+                self.github.add_issue_labels(
+                    repo=service.issue_repo,
+                    issue_number=record.issue_number,
+                    labels=list(pending_labels),
+                )
             issue_action = "updated"
 
-        dispatch = self._maybe_dispatch_codex(service, incident, issue_result, state_key, now)
+        dispatch = self._autofix_wait_status(service)
         LOGGER.info("%s issue for %s fingerprint=%s", issue_action, service.name, incident.fingerprint[:12])
         return {
             "ok": True,
@@ -149,6 +174,22 @@ class SREService:
             "diagnostic": {"path": bundle.path, "reference": bundle.reference},
             "dry_run": self.config.dry_run,
         }
+
+    def poll_autofix_approvals(self, now: datetime | None = None) -> dict[str, Any]:
+        now = now or utc_now()
+        catalog = self._catalog()
+        repos = sorted({service.issue_repo for service in catalog.services if service.sre_enabled and service.autofix})
+        results: list[dict[str, Any]] = []
+
+        self._ensure_autofix_labels(repos)
+        for repo in repos:
+            issues = self.github.list_open_issues_with_label(repo=repo, label=AUTOFIX_APPROVED_LABEL)
+            for issue in issues:
+                results.append(self._handle_autofix_approval(catalog, issue, now))
+
+        if results:
+            LOGGER.info("Processed %s approved autofix issue(s)", len(results))
+        return {"ok": True, "checked_repos": repos, "processed": len(results), "results": results}
 
     def _collect_logs(self, service: ServiceMetadata, incident: Incident, now: datetime) -> str:
         try:
@@ -220,10 +261,9 @@ class SREService:
         digest = hashlib.sha256(signature.encode("utf-8")).hexdigest()
         return f"episode:{service.name}:{digest}"
 
-    def _maybe_dispatch_codex(
+    def _dispatch_codex_for_issue(
         self,
         service: ServiceMetadata,
-        incident: Incident,
         issue: IssueResult,
         state_key: str,
         now: datetime,
@@ -243,12 +283,18 @@ class SREService:
         if self.state.dispatch_count(since=day_start) >= self.config.codex_global_daily_limit:
             return {"attempted": False, "reason": "global daily limit"}
 
+        fingerprint = dispatch_fingerprint(state_key)
+        branch = f"codex/sre-{issue.number}-{fingerprint}"
+        if self.github.open_pull_request_exists(repo=service.source_repo, branch=branch):
+            return {"attempted": False, "reason": "open SRE PR", "branch": branch}
+
         payload = {
             "issue_number": issue.number,
             "issue_url": issue.url,
-            "fingerprint": incident.fingerprint,
+            "fingerprint": fingerprint,
+            "state_fingerprint": state_key,
             "service_name": service.name,
-            "container_name": incident.container_name,
+            "container_name": service.containers[0] if service.containers else service.name,
             "deployment_repo": service.deploy_repo,
             "deployment_path": service.deploy_path,
         }
@@ -263,7 +309,105 @@ class SREService:
             fingerprint=state_key,
             now=now,
         )
-        return {"attempted": True, "repo": service.source_repo, "event_type": "homelab-sre-investigate"}
+        return {
+            "attempted": True,
+            "repo": service.source_repo,
+            "event_type": "homelab-sre-investigate",
+            "branch": branch,
+        }
+
+    def _handle_autofix_approval(
+        self,
+        catalog: ServiceCatalog,
+        issue: GitHubIssue,
+        now: datetime,
+    ) -> dict[str, Any]:
+        labels = set(issue.labels)
+        if SRE_LABEL not in labels:
+            return {"issue": issue.number, "status": "ignored", "reason": "missing homelab-sre label"}
+        if HUMAN_INVESTIGATING_LABEL in labels:
+            return {"issue": issue.number, "status": "skipped", "reason": "human investigating"}
+
+        record = self.state.get_incident_by_issue(issue_repo=issue.repo, issue_number=issue.number)
+        if record is None:
+            return self._block_autofix(
+                issue,
+                reason="no matching incident state",
+                comment="Autofix approval was blocked because this issue does not map to local SRE incident state.",
+            )
+
+        service = next(
+            (item for item in catalog.services if item.name == record.service_name and item.issue_repo == record.issue_repo),
+            None,
+        )
+        if service is None:
+            return self._block_autofix(
+                issue,
+                reason="service metadata missing",
+                comment=f"Autofix approval was blocked because service `{record.service_name}` is no longer in SRE metadata.",
+            )
+
+        issue_result = IssueResult(repo=issue.repo, number=issue.number, url=issue.url)
+        dispatch = self._dispatch_codex_for_issue(service, issue_result, record.fingerprint, now)
+        if dispatch.get("attempted"):
+            self._mark_autofix_started(issue, dispatch)
+            return {"issue": issue.number, "status": "dispatched", "dispatch": dispatch}
+
+        reason = str(dispatch.get("reason") or "dispatch blocked")
+        if reason in {"investigation cooldown", "open SRE PR"}:
+            self._mark_autofix_started(issue, dispatch)
+            return {"issue": issue.number, "status": "already-started", "dispatch": dispatch}
+
+        return self._block_autofix(
+            issue,
+            reason=reason,
+            comment=f"Autofix approval was blocked by SRE safety gate: `{reason}`.",
+        )
+
+    def _mark_autofix_started(self, issue: GitHubIssue, dispatch: dict[str, Any]) -> None:
+        self._ensure_labels(issue.repo, (AUTOFIX_STARTED_LABEL,))
+        self.github.add_issue_labels(repo=issue.repo, issue_number=issue.number, labels=[AUTOFIX_STARTED_LABEL])
+        self.github.remove_issue_label(repo=issue.repo, issue_number=issue.number, label=AUTOFIX_APPROVED_LABEL)
+        self.github.remove_issue_label(repo=issue.repo, issue_number=issue.number, label=AUTOFIX_PENDING_LABEL)
+        branch = dispatch.get("branch")
+        body = "Autofix approval accepted. Codex investigation has been dispatched."
+        if branch:
+            body += f"\n\nExpected branch: `{branch}`"
+        self.github.comment_issue(repo=issue.repo, issue_number=issue.number, body=body)
+
+    def _block_autofix(self, issue: GitHubIssue, *, reason: str, comment: str) -> dict[str, Any]:
+        self._ensure_labels(issue.repo, (AUTOFIX_BLOCKED_LABEL,))
+        self.github.add_issue_labels(repo=issue.repo, issue_number=issue.number, labels=[AUTOFIX_BLOCKED_LABEL])
+        self.github.remove_issue_label(repo=issue.repo, issue_number=issue.number, label=AUTOFIX_APPROVED_LABEL)
+        self.github.comment_issue(repo=issue.repo, issue_number=issue.number, body=comment)
+        return {"issue": issue.number, "status": "blocked", "reason": reason}
+
+    def _autofix_wait_status(self, service: ServiceMetadata) -> dict[str, Any]:
+        if service.unknown:
+            return {"attempted": False, "reason": "unknown service"}
+        if not service.autofix:
+            return {"attempted": False, "reason": "autofix disabled"}
+        if not service.source_repo:
+            return {"attempted": False, "reason": "source repo missing"}
+        return {
+            "attempted": False,
+            "reason": "autofix approval required",
+            "approval_label": AUTOFIX_APPROVED_LABEL,
+        }
+
+    def _autofix_pending_labels(self, service: ServiceMetadata) -> tuple[str, ...]:
+        if service.unknown or not service.autofix or not service.source_repo:
+            return ()
+        return (AUTOFIX_PENDING_LABEL,)
+
+    def _ensure_autofix_labels(self, repos: list[str]) -> None:
+        for repo in repos:
+            self._ensure_labels(repo, tuple(AUTOFIX_LABELS))
+
+    def _ensure_labels(self, repo: str, labels: tuple[str, ...] | list[str]) -> None:
+        for label in labels:
+            color, description = AUTOFIX_LABELS.get(label, ("ededed", "Homelab SRE"))
+            self.github.ensure_label(repo=repo, name=label, color=color, description=description)
 
     def _catalog(self) -> ServiceCatalog:
         if self.catalog_loader is not None:
@@ -318,6 +462,7 @@ def issue_body(
             f"- Deploy path: `{service.deploy_path or 'unknown'}`",
             f"- Runbook: {service.runbook_url or 'none'}",
             f"- Codex autofix: `{service.autofix}`",
+            f"- Autofix approval label: `{AUTOFIX_APPROVED_LABEL}`" if service.autofix else "- Autofix approval label: `not enabled`",
             f"- SRE dry run: `{dry_run}`",
             "",
             "## Expected Fix Discipline",
@@ -381,6 +526,10 @@ def strip_log_timestamp(line: str) -> str:
 
 def normalize_for_key(value: str) -> str:
     return re.sub(r"\s+", " ", strip_log_timestamp(value)).strip().lower()
+
+
+def dispatch_fingerprint(state_key: str) -> str:
+    return hashlib.sha256(state_key.encode("utf-8")).hexdigest()[:16]
 
 
 def limit_bytes(value: str, max_bytes: int) -> str:

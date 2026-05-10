@@ -22,6 +22,7 @@ class Config:
     diagnostic_max_bytes: int
     investigation_cooldown_seconds: int
     codex_global_daily_limit: int
+    approval_poll_seconds: int
     service_host: str
     service_port: int
     http_timeout_seconds: float
@@ -47,6 +48,7 @@ class Config:
             diagnostic_max_bytes=parse_int("SRE_DIAGNOSTIC_MAX_BYTES", 1_000_000),
             investigation_cooldown_seconds=parse_int("SRE_INVESTIGATION_COOLDOWN_SECONDS", 86400),
             codex_global_daily_limit=parse_int("SRE_CODEX_GLOBAL_DAILY_LIMIT", 3),
+            approval_poll_seconds=parse_int("SRE_APPROVAL_POLL_SECONDS", 300),
             service_host=os.environ.get("SERVICE_HOST", "0.0.0.0"),
             service_port=parse_int("SERVICE_PORT", 8094),
             http_timeout_seconds=float(os.environ.get("SRE_HTTP_TIMEOUT_SECONDS", "10")),

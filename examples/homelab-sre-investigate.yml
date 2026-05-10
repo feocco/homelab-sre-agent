@@ -32,6 +32,7 @@ jobs:
             - Service: ${{ github.event.client_payload.service_name }}
             - Container: ${{ github.event.client_payload.container_name }}
             - Fingerprint: ${{ github.event.client_payload.fingerprint }}
+            - State fingerprint: ${{ github.event.client_payload.state_fingerprint }}
             - Deployment repo: ${{ github.event.client_payload.deployment_repo }}
             - Deployment path: ${{ github.event.client_payload.deployment_path }}
 

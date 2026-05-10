@@ -88,6 +88,18 @@ class StateStore:
         ).fetchone()
         return incident_from_row(row)
 
+    def get_incident_by_issue(self, *, issue_repo: str, issue_number: int) -> IncidentRecord | None:
+        row = self.connection.execute(
+            """
+            SELECT * FROM incidents
+            WHERE issue_repo = ? AND issue_number = ?
+            ORDER BY last_seen_at DESC
+            LIMIT 1
+            """,
+            (issue_repo, issue_number),
+        ).fetchone()
+        return incident_from_row(row)
+
     def recent_incident_for_service(
         self,
         *,
