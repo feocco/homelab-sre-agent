@@ -34,6 +34,7 @@ class FakeGitHub(GitHubClient):
         super().__init__(token=None, api_url="https://api.github.com", dry_run=True, timeout_seconds=10)
         self.next_issue_number = 2
         self.issues: dict[tuple[str, int], GitHubIssue] = {}
+        self.ensured_labels: list[tuple[str, str]] = []
 
     def create_issue(self, *, repo: str, title: str, body: str, labels: list[str]) -> IssueResult:
         issue = GitHubIssue(
@@ -80,6 +81,9 @@ class FakeGitHub(GitHubClient):
         self.dry_run_actions.append(
             {"action": "remove_issue_label", "repo": repo, "issue_number": issue_number, "label": label}
         )
+
+    def ensure_label(self, *, repo: str, name: str, color: str, description: str) -> None:
+        self.ensured_labels.append((repo, name))
 
 
 def make_config(
@@ -158,6 +162,7 @@ services:
             by_image = catalog.match(container_name="renamed", image="ghcr.io/feocco/plant-monitor:latest")
             self.assertEqual(by_container.source_repo, "feocco/plant-monitor")
             self.assertEqual(by_image.name, "plant-monitor")
+            self.assertFalse(by_container.sre_enabled)
 
 
 class RedactionTests(TestCase):
@@ -212,6 +217,8 @@ services:
     containers: [plant-monitor]
     source:
       repo: feocco/plant-monitor
+    sre:
+      enabled: true
 """,
             encoding="utf-8",
         )
@@ -233,6 +240,8 @@ services:
     containers: [plant-monitor]
     source:
       repo: feocco/hello-nas
+    sre:
+      enabled: true
 """,
             encoding="utf-8",
         )
@@ -241,15 +250,34 @@ services:
         self.assertEqual(first["issue"]["repo"], "feocco/plant-monitor")
         self.assertEqual(second["issue"]["repo"], "feocco/hello-nas")
 
-    def test_unknown_service_creates_homelab_config_issue_without_dispatch(self) -> None:
+    def test_unknown_service_is_ignored_without_issue(self) -> None:
         tmp, service, github = self.make_service("services: {}\n")
         self.addCleanup(tmp.cleanup)
 
         result = service.handle_incident(payload(container="mystery-service"))
 
-        self.assertEqual(result["issue"]["repo"], "feocco/homelab-config")
-        self.assertEqual(result["dispatch"]["reason"], "unknown service")
-        self.assertEqual(github.dry_run_actions[0]["action"], "create_issue")
+        self.assertEqual(result["status"], "ignored")
+        self.assertEqual(result["reason"], "sre disabled")
+        self.assertEqual(result["service"], "unknown-mystery-service")
+        self.assertEqual(github.dry_run_actions, [])
+
+    def test_service_requires_explicit_sre_enabled(self) -> None:
+        tmp, service, github = self.make_service(
+            """
+services:
+  plant-monitor:
+    containers: [plant-monitor]
+    source:
+      repo: feocco/plant-monitor
+"""
+        )
+        self.addCleanup(tmp.cleanup)
+
+        result = service.handle_incident(payload())
+
+        self.assertEqual(result["status"], "ignored")
+        self.assertEqual(result["reason"], "sre disabled")
+        self.assertEqual(github.dry_run_actions, [])
 
     def test_duplicate_fingerprint_comments_existing_issue(self) -> None:
         tmp, service, github = self.make_service(
@@ -259,6 +287,8 @@ services:
     containers: [plant-monitor]
     source:
       repo: feocco/plant-monitor
+    sre:
+      enabled: true
 """
         )
         self.addCleanup(tmp.cleanup)
@@ -278,6 +308,7 @@ services:
     source:
       repo: feocco/plant-monitor
     sre:
+      enabled: true
       autofix: true
       repo_daily_limit: 1
 """,
@@ -303,6 +334,33 @@ services:
         self.assertNotIn(AUTOFIX_APPROVED_LABEL, github.issues[issue_key].labels)
         self.assertNotIn(AUTOFIX_PENDING_LABEL, github.issues[issue_key].labels)
 
+    def test_poll_does_not_reensure_labels_without_approved_issues(self) -> None:
+        github = FakeGitHub()
+        tmp, service, github = self.make_service(
+            """
+services:
+  plant-monitor:
+    containers: [plant-monitor]
+    source:
+      repo: feocco/plant-monitor
+    sre:
+      enabled: true
+      autofix: true
+      repo_daily_limit: 1
+""",
+            github=github,
+        )
+        self.addCleanup(tmp.cleanup)
+
+        service.ensure_autofix_labels()
+        self.assertIn(("feocco/plant-monitor", AUTOFIX_APPROVED_LABEL), github.ensured_labels)
+
+        github.ensured_labels.clear()
+        poll_result = service.poll_autofix_approvals()
+
+        self.assertEqual(poll_result["processed"], 0)
+        self.assertEqual(github.ensured_labels, [])
+
     def test_approved_autofix_obeys_repo_daily_limit(self) -> None:
         github = FakeGitHub()
         tmp, service, github = self.make_service(
@@ -313,6 +371,7 @@ services:
     source:
       repo: feocco/plant-monitor
     sre:
+      enabled: true
       autofix: true
       repo_daily_limit: 1
 """,
@@ -351,6 +410,8 @@ services:
     containers: [plant-monitor]
     source:
       repo: feocco/plant-monitor
+    sre:
+      enabled: true
 """,
             logs="ERROR HA_LONG_LIVED_TOKEN=super-secret-value failed",
         )
@@ -373,6 +434,8 @@ services:
     containers: [plant-monitor]
     source:
       repo: feocco/plant-monitor
+    sre:
+      enabled: true
 """,
             logs="ERROR request failed\nTraceback\nNameError: name 'CANARY_STATUS' is not defined",
         )

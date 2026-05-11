@@ -129,7 +129,7 @@ class SREService:
         title = issue_title(service, incident, state_key)
         labels = sorted(set(service.labels + (SRE_LABEL, incident.severity.lower()) + self._autofix_pending_labels(service)))
         if record.issue_number is None:
-            self._ensure_labels(service.issue_repo, labels)
+            self._ensure_service_labels(service, labels)
             issue = self.github.create_issue(
                 repo=service.issue_repo,
                 title=title,
@@ -155,7 +155,7 @@ class SREService:
                 fingerprint=state_key,
                 since=now - timedelta(seconds=self.config.investigation_cooldown_seconds),
             ):
-                self._ensure_labels(service.issue_repo, pending_labels)
+                self._ensure_service_labels(service, pending_labels)
                 self.github.add_issue_labels(
                     repo=service.issue_repo,
                     issue_number=record.issue_number,
@@ -178,10 +178,9 @@ class SREService:
     def poll_autofix_approvals(self, now: datetime | None = None) -> dict[str, Any]:
         now = now or utc_now()
         catalog = self._catalog()
-        repos = sorted({service.issue_repo for service in catalog.services if service.sre_enabled and service.autofix})
+        repos = self._autofix_issue_repos(catalog)
         results: list[dict[str, Any]] = []
 
-        self._ensure_autofix_labels(repos)
         for repo in repos:
             issues = self.github.list_open_issues_with_label(repo=repo, label=AUTOFIX_APPROVED_LABEL)
             for issue in issues:
@@ -316,6 +315,9 @@ class SREService:
             "branch": branch,
         }
 
+    def ensure_autofix_labels(self) -> None:
+        self._ensure_autofix_labels(self._autofix_issue_repos(self._catalog()))
+
     def _handle_autofix_approval(
         self,
         catalog: ServiceCatalog,
@@ -399,6 +401,14 @@ class SREService:
         if service.unknown or not service.autofix or not service.source_repo:
             return ()
         return (AUTOFIX_PENDING_LABEL,)
+
+    def _ensure_service_labels(self, service: ServiceMetadata, labels: tuple[str, ...] | list[str]) -> None:
+        self._ensure_labels(service.issue_repo, labels)
+        if not service.unknown and service.autofix and service.source_repo:
+            self._ensure_autofix_labels([service.issue_repo])
+
+    def _autofix_issue_repos(self, catalog: ServiceCatalog) -> list[str]:
+        return sorted({service.issue_repo for service in catalog.services if service.sre_enabled and service.autofix})
 
     def _ensure_autofix_labels(self, repos: list[str]) -> None:
         for repo in repos:

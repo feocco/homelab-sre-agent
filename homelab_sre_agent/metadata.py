@@ -20,7 +20,7 @@ class ServiceMetadata:
     deploy_path: str | None
     runbook_url: str | None
     labels: tuple[str, ...] = field(default_factory=tuple)
-    sre_enabled: bool = True
+    sre_enabled: bool = False
     autofix: bool = False
     repo_daily_limit: int = 1
     unknown: bool = False
@@ -86,7 +86,7 @@ def load_catalog(path: Path, *, default_issue_repo: str) -> ServiceCatalog:
                 deploy_path=optional_str(deploy.get("path")),
                 runbook_url=optional_str(raw.get("runbook_url")),
                 labels=tuple_values(raw.get("labels"), default=("homelab-sre",)),
-                sre_enabled=parse_bool(sre.get("enabled"), True),
+                sre_enabled=parse_bool(sre.get("enabled"), False),
                 autofix=parse_bool(sre.get("autofix"), False),
                 repo_daily_limit=parse_int(sre.get("repo_daily_limit"), 1),
             )
@@ -106,7 +106,7 @@ def unknown_service(container_name: str, default_issue_repo: str) -> ServiceMeta
         deploy_path=None,
         runbook_url=None,
         labels=("homelab-sre", "unknown-service"),
-        sre_enabled=True,
+        sre_enabled=False,
         autofix=False,
         repo_daily_limit=0,
         unknown=True,

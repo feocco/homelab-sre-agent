@@ -17,6 +17,7 @@ GitHub `repository_dispatch` event.
   reference.
 - Reads private service metadata from `SRE_SERVICE_METADATA_PATH` on every
   incident.
+- Ignores containers that do not match an explicitly enabled metadata service.
 - Starts in `SRE_DRY_RUN=true`, recording intended GitHub actions without
   writing to GitHub.
 - Creates one issue per incident episode, so traceback bursts update the same
@@ -74,6 +75,10 @@ The metadata file is mounted read-only into the container and reloaded for each
 incident. A normal `homelab-config` deploy is enough to update mappings,
 runbook links, and `sre.autofix` choices; the SRE agent does not need a code
 change for metadata-only edits.
+
+Services must set `sre.enabled: true` to create or update issues. Unknown
+containers, and metadata entries without `sre.enabled: true`, are ignored by
+the SRE agent.
 
 ## Codex Autofix
 

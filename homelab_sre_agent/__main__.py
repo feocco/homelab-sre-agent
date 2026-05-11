@@ -45,6 +45,10 @@ def start_approval_poller(config: Config, service: SREService) -> None:
         return
 
     logger = logging.getLogger("homelab-sre-agent.approvals")
+    try:
+        service.ensure_autofix_labels()
+    except Exception:
+        logger.exception("Autofix label startup ensure failed")
 
     def poll_forever() -> None:
         while True:
