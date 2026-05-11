@@ -8,7 +8,7 @@ import time
 
 from .config import Config
 from .docker_logs import DockerLogCollector
-from .github import GitHubClient
+from .github import github_client_from_config
 from .metadata import load_catalog
 from .notifications import IssueNotifier, PhoneApprovalListener
 from .server import SREServer
@@ -23,12 +23,7 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
     state = StateStore(config.state_path)
-    github = GitHubClient(
-        token=config.github_token,
-        api_url=config.github_api_url,
-        dry_run=config.dry_run,
-        timeout_seconds=config.http_timeout_seconds,
-    )
+    github = github_client_from_config(config)
     service = SREService(
         config=config,
         catalog_loader=lambda: load_catalog(config.service_metadata_path, default_issue_repo=config.default_issue_repo),

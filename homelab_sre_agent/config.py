@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -13,6 +14,10 @@ class Config:
     diagnostic_reference_root: str
     incident_token: str | None
     github_token: str | None
+    github_auth_mode: str
+    github_app_id: str | None
+    github_app_installation_id: str | None
+    github_app_private_key: str | None
     github_api_url: str
     default_issue_repo: str
     dry_run: bool
@@ -42,6 +47,10 @@ class Config:
             diagnostic_reference_root=os.environ.get("SRE_DIAGNOSTIC_REFERENCE_ROOT", str(diagnostic_dir)),
             incident_token=optional(os.environ.get("SRE_INCIDENT_TOKEN")),
             github_token=optional(os.environ.get("GITHUB_TOKEN")),
+            github_auth_mode=os.environ.get("GITHUB_AUTH_MODE", "token").strip().lower() or "token",
+            github_app_id=optional(os.environ.get("GITHUB_APP_ID")),
+            github_app_installation_id=optional(os.environ.get("GITHUB_APP_INSTALLATION_ID")),
+            github_app_private_key=github_app_private_key_from_env(),
             github_api_url=os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/"),
             default_issue_repo=os.environ.get("SRE_DEFAULT_ISSUE_REPO", "feocco/homelab-config"),
             dry_run=parse_bool(os.environ.get("SRE_DRY_RUN"), True),
@@ -69,6 +78,19 @@ def optional(value: str | None) -> str | None:
     if not stripped or stripped == "replace_me":
         return None
     return stripped
+
+
+def github_app_private_key_from_env() -> str | None:
+    raw = optional(os.environ.get("GITHUB_APP_PRIVATE_KEY"))
+    if raw:
+        return raw.replace("\\n", "\n")
+    encoded = optional(os.environ.get("GITHUB_APP_PRIVATE_KEY_B64"))
+    if not encoded:
+        return None
+    try:
+        return base64.b64decode(encoded).decode("utf-8")
+    except Exception as exc:
+        raise ValueError("GITHUB_APP_PRIVATE_KEY_B64 must be valid base64-encoded UTF-8") from exc
 
 
 def parse_bool(value: str | None, default: bool) -> bool:

@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import base64
 from datetime import datetime, timedelta, timezone
+import os
 from pathlib import Path
 import threading
 import tempfile
 import time
 from unittest import TestCase
+from unittest.mock import patch
 
 from homelab_sre_agent.config import Config
 from homelab_sre_agent.docker_logs import DockerLogCollector
-from homelab_sre_agent.github import GitHubClient, GitHubIssue, IssueResult
+from homelab_sre_agent.github import GitHubAppInstallationAuth, GitHubClient, GitHubIssue, IssueResult, github_client_from_config
 from homelab_sre_agent.metadata import load_catalog
 from homelab_sre_agent.notifications import (
     PHONE_APPROVAL_TOKEN_TTL_SECONDS,
@@ -157,6 +160,10 @@ def make_config(
         diagnostic_reference_root="/nas/diagnostics",
         incident_token="secret",
         github_token=None,
+        github_auth_mode="token",
+        github_app_id=None,
+        github_app_installation_id=None,
+        github_app_private_key=None,
         github_api_url="https://api.github.com",
         default_issue_repo="feocco/homelab-config",
         dry_run=dry_run,
@@ -234,6 +241,67 @@ class RedactionTests(TestCase):
         self.assertNotIn("my-token", redacted)
         self.assertNotIn("user:pass", redacted)
         self.assertIn("Authorization=<redacted>", redacted)
+
+
+class ConfigTests(TestCase):
+    def test_config_decodes_github_app_private_key_b64(self) -> None:
+        encoded_key = base64.b64encode(b"private-key").decode("ascii")
+
+        with patch.dict(os.environ, {"GITHUB_AUTH_MODE": "app", "GITHUB_APP_PRIVATE_KEY_B64": encoded_key}, clear=True):
+            config = Config.from_env()
+
+        self.assertEqual(config.github_auth_mode, "app")
+        self.assertEqual(config.github_app_private_key, "private-key")
+
+    def test_github_app_auth_requires_complete_config_when_not_dry_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(Path(tmp), dry_run=False)
+            config = Config(
+                **{
+                    **config.__dict__,
+                    "github_auth_mode": "app",
+                }
+            )
+
+            with self.assertRaisesRegex(ValueError, "GITHUB_APP_ID"):
+                github_client_from_config(config)
+
+
+class FakeAppAuth(GitHubAppInstallationAuth):
+    def __init__(self) -> None:
+        self.now = 1_779_000_000.0
+        self.requests: list[str] = []
+        super().__init__(
+            app_id="123",
+            installation_id="456",
+            private_key="unused",
+            api_url="https://api.github.com",
+            timeout_seconds=10,
+            now_func=lambda: self.now,
+        )
+
+    def _make_jwt(self, now: float) -> str:
+        return f"jwt-{int(now)}"
+
+    def _post_installation_token(self, jwt_token: str) -> dict:
+        self.requests.append(jwt_token)
+        expires = datetime.fromtimestamp(self.now + 3600, timezone.utc).isoformat().replace("+00:00", "Z")
+        return {"token": f"token-{len(self.requests)}", "expires_at": expires}
+
+
+class GitHubAppAuthTests(TestCase):
+    def test_installation_token_is_cached_until_near_expiration(self) -> None:
+        auth = FakeAppAuth()
+
+        first = auth.token()
+        second = auth.token()
+        auth.now += 3400
+        third = auth.token()
+
+        self.assertEqual(first, "token-1")
+        self.assertEqual(second, "token-1")
+        self.assertEqual(third, "token-2")
+        self.assertEqual(auth.requests, ["jwt-1779000000", "jwt-1779003400"])
 
 
 class ServiceTests(TestCase):

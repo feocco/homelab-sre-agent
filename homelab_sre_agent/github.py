@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 import json
-from typing import Any
+import threading
+import time
+from typing import Any, Callable
 from urllib.error import HTTPError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
+
+from .config import Config
 
 
 @dataclass(frozen=True)
@@ -24,9 +29,89 @@ class GitHubIssue:
     labels: tuple[str, ...]
 
 
+class GitHubAppInstallationAuth:
+    def __init__(
+        self,
+        *,
+        app_id: str,
+        installation_id: str,
+        private_key: str,
+        api_url: str,
+        timeout_seconds: float,
+        now_func: Callable[[], float] | None = None,
+    ) -> None:
+        self.app_id = app_id
+        self.installation_id = installation_id
+        self.private_key = private_key
+        self.api_url = api_url.rstrip("/")
+        self.timeout_seconds = timeout_seconds
+        self.now_func = now_func or time.time
+        self._token: str | None = None
+        self._expires_at = 0.0
+        self._lock = threading.Lock()
+
+    def token(self) -> str:
+        now = self.now_func()
+        if self._token and now < self._expires_at - 300:
+            return self._token
+
+        with self._lock:
+            now = self.now_func()
+            if self._token and now < self._expires_at - 300:
+                return self._token
+            response = self._post_installation_token(self._make_jwt(now))
+            token = str(response.get("token") or "")
+            expires_at = str(response.get("expires_at") or "")
+            if not token or not expires_at:
+                raise RuntimeError("GitHub App installation token response was missing token or expires_at")
+            self._token = token
+            self._expires_at = datetime.fromisoformat(expires_at.replace("Z", "+00:00")).timestamp()
+            return self._token
+
+    def _make_jwt(self, now: float) -> str:
+        import jwt
+
+        payload = {
+            "iat": int(now) - 60,
+            "exp": int(now) + 540,
+            "iss": self.app_id,
+        }
+        return str(jwt.encode(payload, self.private_key, algorithm="RS256"))
+
+    def _post_installation_token(self, jwt_token: str) -> dict[str, Any]:
+        request = Request(
+            f"{self.api_url}/app/installations/{quote(self.installation_id, safe='')}/access_tokens",
+            data=b"{}",
+            method="POST",
+            headers={
+                "Accept": "application/vnd.github+json",
+                "Authorization": f"Bearer {jwt_token}",
+                "Content-Type": "application/json",
+                "User-Agent": "homelab-sre-agent",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+        )
+        try:
+            with urlopen(request, timeout=self.timeout_seconds) as response:
+                data = response.read()
+        except HTTPError as exc:
+            details = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"GitHub App token request failed: {exc.code} {details}") from exc
+        return json.loads(data.decode("utf-8"))
+
+
 class GitHubClient:
-    def __init__(self, *, token: str | None, api_url: str, dry_run: bool, timeout_seconds: float) -> None:
+    def __init__(
+        self,
+        *,
+        token: str | None,
+        api_url: str,
+        dry_run: bool,
+        timeout_seconds: float,
+        token_provider: Callable[[], str | None] | None = None,
+    ) -> None:
         self.token = token
+        self.token_provider = token_provider
         self.api_url = api_url.rstrip("/")
         self.dry_run = dry_run
         self.timeout_seconds = timeout_seconds
@@ -181,12 +266,13 @@ class GitHubClient:
         expect_json: bool = True,
         not_found_ok: bool = False,
     ) -> Any:
-        if not self.token:
-            raise RuntimeError("GITHUB_TOKEN is required when SRE_DRY_RUN=false")
+        token = self._auth_token()
+        if not token:
+            raise RuntimeError("GITHUB_TOKEN or GitHub App auth is required when SRE_DRY_RUN=false")
         body = json.dumps(payload).encode("utf-8") if payload is not None else None
         headers = {
             "Accept": "application/vnd.github+json",
-            "Authorization": f"Bearer {self.token}",
+            "Authorization": f"Bearer {token}",
             "User-Agent": "homelab-sre-agent",
             "X-GitHub-Api-Version": "2022-11-28",
         }
@@ -212,6 +298,48 @@ class GitHubClient:
             return {}
         decoded = json.loads(data.decode("utf-8"))
         return decoded
+
+    def _auth_token(self) -> str | None:
+        if self.token_provider is not None:
+            return self.token_provider()
+        return self.token
+
+
+def github_client_from_config(config: Config) -> GitHubClient:
+    token_provider = None
+    token = config.github_token
+    if config.github_auth_mode == "app":
+        missing = [
+            name
+            for name, value in (
+                ("GITHUB_APP_ID", config.github_app_id),
+                ("GITHUB_APP_INSTALLATION_ID", config.github_app_installation_id),
+                ("GITHUB_APP_PRIVATE_KEY_B64", config.github_app_private_key),
+            )
+            if not value
+        ]
+        if missing and not config.dry_run:
+            raise ValueError(f"GitHub App auth is missing required config: {', '.join(missing)}")
+        if not missing:
+            app_auth = GitHubAppInstallationAuth(
+                app_id=config.github_app_id or "",
+                installation_id=config.github_app_installation_id or "",
+                private_key=config.github_app_private_key or "",
+                api_url=config.github_api_url,
+                timeout_seconds=config.http_timeout_seconds,
+            )
+            token_provider = app_auth.token
+            token = None
+    elif config.github_auth_mode != "token":
+        raise ValueError("GITHUB_AUTH_MODE must be 'token' or 'app'")
+
+    return GitHubClient(
+        token=token,
+        token_provider=token_provider,
+        api_url=config.github_api_url,
+        dry_run=config.dry_run,
+        timeout_seconds=config.http_timeout_seconds,
+    )
 
 
 def repo_path(repo: str) -> str:
