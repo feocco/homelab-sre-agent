@@ -49,7 +49,11 @@ SRE_APPROVAL_POLL_SECONDS=300
 SRE_ISSUE_NOTIFICATIONS_ENABLED=false
 SRE_PHONE_APPROVALS_ENABLED=false
 SRE_HTTP_TIMEOUT_SECONDS=10
+GITHUB_AUTH_MODE=token
 GITHUB_TOKEN=replace_me
+GITHUB_APP_ID=replace_me
+GITHUB_APP_INSTALLATION_ID=replace_me
+GITHUB_APP_PRIVATE_KEY_B64=replace_me
 GITHUB_API_URL=https://api.github.com
 HOMELAB_FUNCTIONS_URL=http://nasfeo:8091
 HOMELAB_FUNCTIONS_TOKEN=replace_me
@@ -60,9 +64,12 @@ SERVICE_PORT=8094
 LOG_LEVEL=INFO
 ```
 
-When `SRE_DRY_RUN=false`, `GITHUB_TOKEN` must have permission to create issues
-in the configured issue repos and dispatch workflows in autofix-enabled source
-repos.
+When `SRE_DRY_RUN=false`, GitHub authentication must be configured. The default
+is `GITHUB_AUTH_MODE=token`, which uses `GITHUB_TOKEN`. Prefer
+`GITHUB_AUTH_MODE=app` for production so comments, labels, and dispatches are
+attributed to the GitHub App instead of a personal token owner. App mode
+requires `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID`, and
+`GITHUB_APP_PRIVATE_KEY_B64`.
 
 For public issue repos, keep full logs local. Set
 `SRE_DIAGNOSTIC_REFERENCE_ROOT` to the NAS host path for the mounted state
