@@ -103,8 +103,11 @@ The target repo should include a workflow like
 `examples/homelab-sre-investigate.yml`, backed by an `OPENAI_API_KEY` secret and
 a token that can create draft PRs.
 
-The workflow should create a draft PR only. Human review remains the deployment
-gate.
+The workflow should create a draft PR only. It should also have Codex write the
+PR body to `.codex/sre-pr-body.md`, then pass that file to
+`peter-evans/create-pull-request` with `body-path`. The PR body should explain
+the triggering issue, root cause or reason for the change, fix details,
+validation, and remaining risk. Human review remains the deployment gate.
 
 ## Run Locally
 
