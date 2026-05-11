@@ -99,14 +99,15 @@ Useful labels:
 - `sre:human-investigating`: leave approval in place but do not dispatch while
   a person is working.
 
-The target repo should include a workflow like
+The target repo should include a small dispatch wrapper like
 `examples/homelab-sre-investigate.yml`, backed by an `OPENAI_API_KEY` secret and
-a token that can create draft PRs.
+a token that can create draft PRs. The wrapper calls the reusable workflow in
+this repo at `.github/workflows/homelab-sre-codex.yml`.
 
-The workflow should create a draft PR only. It should also have Codex write the
-PR body to `.codex/sre-pr-body.md`, then pass that file to
-`peter-evans/create-pull-request` with `body-path`. The PR body should explain
-the triggering issue, root cause or reason for the change, fix details,
+The reusable workflow owns the Codex prompt, model, PR body policy, and draft PR
+creation. It writes the PR body to `.codex/sre-pr-body.md`, then passes that
+file to `peter-evans/create-pull-request` with `body-path`. The PR body should
+explain the triggering issue, root cause or reason for the change, fix details,
 validation, and remaining risk. Human review remains the deployment gate.
 
 ## Run Locally
