@@ -43,9 +43,15 @@ SRE_DIAGNOSTIC_MAX_BYTES=1000000
 SRE_INVESTIGATION_COOLDOWN_SECONDS=86400
 SRE_CODEX_GLOBAL_DAILY_LIMIT=3
 SRE_APPROVAL_POLL_SECONDS=300
+SRE_ISSUE_NOTIFICATIONS_ENABLED=false
+SRE_PHONE_APPROVALS_ENABLED=false
 SRE_HTTP_TIMEOUT_SECONDS=10
 GITHUB_TOKEN=replace_me
 GITHUB_API_URL=https://api.github.com
+HOMELAB_FUNCTIONS_URL=http://nasfeo:8091
+HOMELAB_FUNCTIONS_TOKEN=replace_me
+HA_URL=https://homeassistant.example
+HA_LONG_LIVED_TOKEN=replace_me
 SERVICE_HOST=0.0.0.0
 SERVICE_PORT=8094
 LOG_LEVEL=INFO
@@ -103,6 +109,18 @@ Useful labels:
   failed.
 - `sre:human-investigating`: leave approval in place but do not dispatch while
   a person is working.
+
+## Phone Notifications
+
+Set `SRE_ISSUE_NOTIFICATIONS_ENABLED=true` to send a phone notification when a
+new SRE issue is created. The notification includes an `Open issue` button. If
+`SRE_PHONE_APPROVALS_ENABLED=true` and the service is autofix eligible, it also
+includes an `Approve autofix` button.
+
+Phone approval listens to Home Assistant `mobile_app_notification_action`
+events through the shared `homelab.NotificationActionRouter` helper. Pressing
+the button only applies `sre:autofix-approved`; the normal polling loop still
+performs safety checks before dispatching Codex.
 
 The target repo should include a small dispatch wrapper like
 `examples/homelab-sre-investigate.yml`, backed by an `OPENAI_API_KEY` secret and

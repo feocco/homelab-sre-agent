@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 import threading
@@ -9,6 +10,7 @@ from .config import Config
 from .docker_logs import DockerLogCollector
 from .github import GitHubClient
 from .metadata import load_catalog
+from .notifications import IssueNotifier, PhoneApprovalListener
 from .server import SREServer
 from .service import SREService
 from .state import StateStore
@@ -33,8 +35,10 @@ def main() -> int:
         state=state,
         github=github,
         logs=DockerLogCollector(),
+        issue_notifier=IssueNotifier() if config.issue_notifications_enabled else None,
     )
     start_approval_poller(config, service)
+    start_phone_approval_listener(config, service)
     SREServer(config=config, service=service).serve_forever()
     return 0
 
@@ -63,6 +67,20 @@ def start_approval_poller(config: Config, service: SREService) -> None:
     thread = threading.Thread(target=poll_forever, name="sre-autofix-approvals", daemon=True)
     thread.start()
     logger.info("Autofix approval polling every %s seconds", config.approval_poll_seconds)
+
+
+def start_phone_approval_listener(config: Config, service: SREService) -> None:
+    logger = logging.getLogger("homelab-sre-agent.phone-approvals")
+    if not config.phone_approvals_enabled:
+        logger.info("Phone approval listener disabled")
+        return
+
+    def run_listener() -> None:
+        asyncio.run(PhoneApprovalListener(service).run_forever())
+
+    thread = threading.Thread(target=run_listener, name="sre-phone-approvals", daemon=True)
+    thread.start()
+    logger.info("Phone approval listener enabled")
 
 
 if __name__ == "__main__":

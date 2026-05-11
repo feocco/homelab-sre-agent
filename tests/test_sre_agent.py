@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
 from unittest import TestCase
@@ -8,6 +9,11 @@ from homelab_sre_agent.config import Config
 from homelab_sre_agent.docker_logs import DockerLogCollector
 from homelab_sre_agent.github import GitHubClient, GitHubIssue, IssueResult
 from homelab_sre_agent.metadata import load_catalog
+from homelab_sre_agent.notifications import (
+    PHONE_APPROVAL_TOKEN_TTL_SECONDS,
+    SRE_APPROVE_ACTION_PREFIX,
+    IssueNotifier,
+)
 from homelab_sre_agent.redact import redact_text
 from homelab_sre_agent.service import AUTOFIX_APPROVED_LABEL, AUTOFIX_PENDING_LABEL, AUTOFIX_STARTED_LABEL, SREService
 from homelab_sre_agent.state import StateStore
@@ -86,12 +92,23 @@ class FakeGitHub(GitHubClient):
         self.ensured_labels.append((repo, name))
 
 
+class FakeNotifier:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def notify(self, title: str, message: str, **kwargs):
+        self.calls.append((title, message, kwargs))
+        return {"status": "sent"}
+
+
 def make_config(
     path: Path,
     *,
     dry_run: bool = True,
     episode_window_seconds: int = 120,
     investigation_cooldown_seconds: int = 86400,
+    issue_notifications_enabled: bool = False,
+    phone_approvals_enabled: bool = False,
 ) -> Config:
     return Config(
         state_path=path / "state.sqlite3",
@@ -110,6 +127,8 @@ def make_config(
         investigation_cooldown_seconds=investigation_cooldown_seconds,
         codex_global_daily_limit=3,
         approval_poll_seconds=300,
+        issue_notifications_enabled=issue_notifications_enabled,
+        phone_approvals_enabled=phone_approvals_enabled,
         service_host="127.0.0.1",
         service_port=8094,
         http_timeout_seconds=10,
@@ -185,6 +204,9 @@ class ServiceTests(TestCase):
         episode_window_seconds: int = 120,
         investigation_cooldown_seconds: int = 86400,
         github: GitHubClient | None = None,
+        issue_notifier=None,
+        issue_notifications_enabled: bool = False,
+        phone_approvals_enabled: bool = False,
     ):
         tmp = tempfile.TemporaryDirectory()
         path = Path(tmp.name)
@@ -193,6 +215,8 @@ class ServiceTests(TestCase):
             path,
             episode_window_seconds=episode_window_seconds,
             investigation_cooldown_seconds=investigation_cooldown_seconds,
+            issue_notifications_enabled=issue_notifications_enabled,
+            phone_approvals_enabled=phone_approvals_enabled,
         )
         catalog = load_catalog(config.service_metadata_path, default_issue_repo=config.default_issue_repo)
         github = github or GitHubClient(token=None, api_url=config.github_api_url, dry_run=True, timeout_seconds=10)
@@ -202,6 +226,7 @@ class ServiceTests(TestCase):
             state=StateStore(config.state_path),
             github=github,
             logs=FakeLogs(logs),
+            issue_notifier=issue_notifier,
         )
         return tmp, service, github
 
@@ -333,6 +358,159 @@ services:
         self.assertIn(AUTOFIX_STARTED_LABEL, github.issues[issue_key].labels)
         self.assertNotIn(AUTOFIX_APPROVED_LABEL, github.issues[issue_key].labels)
         self.assertNotIn(AUTOFIX_PENDING_LABEL, github.issues[issue_key].labels)
+
+    def test_new_issue_sends_phone_notification_with_approval_button(self) -> None:
+        github = FakeGitHub()
+        fake_notifier = FakeNotifier()
+        tmp, service, github = self.make_service(
+            """
+services:
+  plant-monitor:
+    containers: [plant-monitor]
+    source:
+      repo: feocco/plant-monitor
+    sre:
+      enabled: true
+      autofix: true
+""",
+            github=github,
+            issue_notifier=IssueNotifier(fake_notifier.notify),
+            issue_notifications_enabled=True,
+            phone_approvals_enabled=True,
+        )
+        self.addCleanup(tmp.cleanup)
+
+        result = service.handle_incident(payload())
+
+        self.assertEqual(result["status"], "created")
+        self.assertEqual(len(fake_notifier.calls), 1)
+        title, message, kwargs = fake_notifier.calls[0]
+        self.assertEqual(title, "SRE issue - plant-monitor")
+        self.assertIn("Issue: feocco/plant-monitor#2", message)
+        self.assertEqual(kwargs["url"], "https://github.com/feocco/plant-monitor/issues/2")
+        buttons = kwargs["buttons"]
+        self.assertEqual(buttons[0]["title"], "Open issue")
+        self.assertEqual(buttons[0]["action"], "URI")
+        self.assertEqual(buttons[1]["title"], "Approve autofix")
+        self.assertTrue(buttons[1]["action"].startswith(f"{SRE_APPROVE_ACTION_PREFIX}::"))
+
+    def test_duplicate_issue_update_does_not_resend_phone_notification(self) -> None:
+        fake_notifier = FakeNotifier()
+        tmp, service, _github = self.make_service(
+            """
+services:
+  plant-monitor:
+    containers: [plant-monitor]
+    source:
+      repo: feocco/plant-monitor
+    sre:
+      enabled: true
+""",
+            issue_notifier=IssueNotifier(fake_notifier.notify),
+            issue_notifications_enabled=True,
+        )
+        self.addCleanup(tmp.cleanup)
+
+        service.handle_incident(payload())
+        service.handle_incident(payload())
+
+        self.assertEqual(len(fake_notifier.calls), 1)
+
+    def test_non_autofix_issue_notification_only_opens_issue(self) -> None:
+        fake_notifier = FakeNotifier()
+        tmp, service, _github = self.make_service(
+            """
+services:
+  plant-monitor:
+    containers: [plant-monitor]
+    source:
+      repo: feocco/plant-monitor
+    sre:
+      enabled: true
+""",
+            issue_notifier=IssueNotifier(fake_notifier.notify),
+            issue_notifications_enabled=True,
+            phone_approvals_enabled=True,
+        )
+        self.addCleanup(tmp.cleanup)
+
+        service.handle_incident(payload())
+
+        buttons = fake_notifier.calls[0][2]["buttons"]
+        self.assertEqual([button["title"] for button in buttons], ["Open issue"])
+
+    def test_phone_approval_adds_label_and_comment(self) -> None:
+        github = FakeGitHub()
+        fake_notifier = FakeNotifier()
+        tmp, service, github = self.make_service(
+            """
+services:
+  plant-monitor:
+    containers: [plant-monitor]
+    source:
+      repo: feocco/plant-monitor
+    sre:
+      enabled: true
+      autofix: true
+""",
+            github=github,
+            issue_notifier=IssueNotifier(fake_notifier.notify),
+            issue_notifications_enabled=True,
+            phone_approvals_enabled=True,
+        )
+        self.addCleanup(tmp.cleanup)
+        result = service.handle_incident(payload())
+        issue_key = ("feocco/plant-monitor", result["issue"]["number"])
+        approval_action = fake_notifier.calls[0][2]["buttons"][1]["action"]
+        token = approval_action.split("::", 1)[1]
+
+        approval_result = service.approve_autofix_from_phone(token)
+
+        self.assertEqual(approval_result["status"], "approved")
+        self.assertIn(AUTOFIX_APPROVED_LABEL, github.issues[issue_key].labels)
+        self.assertEqual(github.dry_run_actions[-1]["action"], "comment_issue")
+        self.assertIn("Autofix approved from the phone notification", github.dry_run_actions[-1]["body"])
+
+        duplicate_result = service.approve_autofix_from_phone(token)
+        self.assertEqual(duplicate_result["status"], "ignored")
+
+    def test_stale_phone_approval_token_is_ignored(self) -> None:
+        github = FakeGitHub()
+        tmp, service, github = self.make_service(
+            """
+services:
+  plant-monitor:
+    containers: [plant-monitor]
+    source:
+      repo: feocco/plant-monitor
+    sre:
+      enabled: true
+      autofix: true
+""",
+            github=github,
+        )
+        self.addCleanup(tmp.cleanup)
+        old = datetime(2026, 5, 1, tzinfo=timezone.utc)
+        token = service.state.create_phone_approval_token(
+            fingerprint="fingerprint",
+            service_name="plant-monitor",
+            issue_repo="feocco/plant-monitor",
+            issue_number=22,
+            issue_url="https://github.com/feocco/plant-monitor/issues/22",
+            now=old,
+        )
+
+        result = service.approve_autofix_from_phone(
+            token,
+            now=old + timedelta(seconds=PHONE_APPROVAL_TOKEN_TTL_SECONDS + 1),
+        )
+
+        self.assertEqual(result["status"], "ignored")
+        self.assertEqual(github.dry_run_actions, [])
+
+        unknown_result = service.approve_autofix_from_phone("not-a-real-token", now=old)
+        self.assertEqual(unknown_result["status"], "ignored")
+        self.assertEqual(github.dry_run_actions, [])
 
     def test_poll_does_not_reensure_labels_without_approved_issues(self) -> None:
         github = FakeGitHub()

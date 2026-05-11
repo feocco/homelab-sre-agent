@@ -12,6 +12,7 @@ from .config import Config
 from .docker_logs import DockerLogCollector
 from .github import GitHubClient, GitHubIssue, IssueResult
 from .metadata import ServiceCatalog, ServiceMetadata
+from .notifications import IssueNotifier, PHONE_APPROVAL_TOKEN_TTL_SECONDS, make_approval_action
 from .redact import redact_text
 from .state import StateStore, utc_now
 
@@ -96,6 +97,7 @@ class SREService:
         state: StateStore,
         github: GitHubClient,
         logs: DockerLogCollector,
+        issue_notifier: IssueNotifier | None = None,
     ) -> None:
         self.config = config
         if catalog is None and catalog_loader is None:
@@ -105,6 +107,7 @@ class SREService:
         self.state = state
         self.github = github
         self.logs = logs
+        self.issue_notifier = issue_notifier
 
     def handle_incident(self, payload: dict[str, Any]) -> dict[str, Any]:
         now = utc_now()
@@ -138,6 +141,7 @@ class SREService:
             )
             self.state.set_issue(fingerprint=state_key, issue_number=issue.number, issue_url=issue.url)
             issue_result = issue
+            self._notify_issue_created(service, incident, analysis, sanitized_line, state_key, issue, now)
             issue_action = "created"
         else:
             issue_result = IssueResult(
@@ -318,6 +322,37 @@ class SREService:
     def ensure_autofix_labels(self) -> None:
         self._ensure_autofix_labels(self._autofix_issue_repos(self._catalog()))
 
+    def approve_autofix_from_phone(self, token: str, now: datetime | None = None) -> dict[str, Any]:
+        now = now or utc_now()
+        approval = self.state.consume_phone_approval_token(
+            token,
+            now=now,
+            max_age_seconds=PHONE_APPROVAL_TOKEN_TTL_SECONDS,
+        )
+        if approval is None:
+            return {"ok": True, "status": "ignored", "reason": "unknown stale or used token"}
+
+        self._ensure_labels(approval.issue_repo, (AUTOFIX_APPROVED_LABEL,))
+        self.github.add_issue_labels(
+            repo=approval.issue_repo,
+            issue_number=approval.issue_number,
+            labels=[AUTOFIX_APPROVED_LABEL],
+        )
+        self.github.comment_issue(
+            repo=approval.issue_repo,
+            issue_number=approval.issue_number,
+            body="Autofix approved from the phone notification. The SRE agent will run normal safety gates before dispatching Codex.",
+        )
+        return {
+            "ok": True,
+            "status": "approved",
+            "issue": {
+                "repo": approval.issue_repo,
+                "number": approval.issue_number,
+                "url": approval.issue_url,
+            },
+        }
+
     def _handle_autofix_approval(
         self,
         catalog: ServiceCatalog,
@@ -406,6 +441,43 @@ class SREService:
         self._ensure_labels(service.issue_repo, labels)
         if not service.unknown and service.autofix and service.source_repo:
             self._ensure_autofix_labels([service.issue_repo])
+
+    def _notify_issue_created(
+        self,
+        service: ServiceMetadata,
+        incident: Incident,
+        analysis: IssueAnalysis,
+        sanitized_line: str,
+        state_key: str,
+        issue: IssueResult,
+        now: datetime,
+    ) -> None:
+        if not self.config.issue_notifications_enabled or self.issue_notifier is None:
+            return
+
+        approval_action = None
+        if self.config.phone_approvals_enabled and self._autofix_pending_labels(service):
+            token = self.state.create_phone_approval_token(
+                fingerprint=state_key,
+                service_name=service.name,
+                issue_repo=issue.repo,
+                issue_number=issue.number,
+                issue_url=issue.url,
+                now=now,
+            )
+            approval_action = make_approval_action(token)
+
+        try:
+            self.issue_notifier.send_issue_created(
+                service=service,
+                incident=incident,
+                analysis=analysis,
+                issue=issue,
+                sanitized_line=sanitized_line,
+                approval_action=approval_action,
+            )
+        except Exception:
+            LOGGER.exception("Failed to send SRE issue notification")
 
     def _autofix_issue_repos(self, catalog: ServiceCatalog) -> list[str]:
         return sorted({service.issue_repo for service in catalog.services if service.sre_enabled and service.autofix})
