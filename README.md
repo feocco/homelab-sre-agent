@@ -2,11 +2,11 @@
 
 Small incident coordinator for homelab log events.
 
-`homelab-log-watcher` stays responsible for Docker log matching and phone
-notifications. This service receives structured incident webhooks, enriches
-them with Docker log context and deployment metadata, then creates or updates a
-GitHub issue. Codex-based autofix is opt-in per service and is triggered with a
-GitHub `repository_dispatch` event.
+`homelab-log-watcher` stays responsible for Docker log matching and incident
+webhook delivery. This service receives structured incidents, enriches them with
+Docker log context and deployment metadata, then creates or updates a GitHub
+issue and can send the phone notification for that issue. Codex-based autofix is
+opt-in per service and is triggered with a GitHub `repository_dispatch` event.
 
 ## Defaults
 
@@ -22,6 +22,8 @@ GitHub `repository_dispatch` event.
   writing to GitHub.
 - Creates one issue per incident episode, so traceback bursts update the same
   issue instead of creating one issue per matching log line.
+- Bundles repeated episode updates into at most one GitHub comment per
+  `SRE_ISSUE_COMMENT_COOLDOWN_SECONDS`.
 - Keeps Codex dispatch disabled unless service metadata sets `sre.autofix:
   true` and an issue receives the `sre:autofix-approved` label.
 - Polls GitHub for approved SRE issues every `SRE_APPROVAL_POLL_SECONDS`.
@@ -41,6 +43,7 @@ SRE_DOCKER_LOG_LOOKBACK_SECONDS=600
 SRE_EPISODE_WINDOW_SECONDS=120
 SRE_DIAGNOSTIC_MAX_BYTES=1000000
 SRE_INVESTIGATION_COOLDOWN_SECONDS=86400
+SRE_ISSUE_COMMENT_COOLDOWN_SECONDS=3600
 SRE_CODEX_GLOBAL_DAILY_LIMIT=3
 SRE_APPROVAL_POLL_SECONDS=300
 SRE_ISSUE_NOTIFICATIONS_ENABLED=false

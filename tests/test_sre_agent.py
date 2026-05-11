@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import threading
 import tempfile
+import time
 from unittest import TestCase
 
 from homelab_sre_agent.config import Config
@@ -15,7 +17,15 @@ from homelab_sre_agent.notifications import (
     IssueNotifier,
 )
 from homelab_sre_agent.redact import redact_text
-from homelab_sre_agent.service import AUTOFIX_APPROVED_LABEL, AUTOFIX_PENDING_LABEL, AUTOFIX_STARTED_LABEL, SREService
+from homelab_sre_agent.service import (
+    AUTOFIX_APPROVED_LABEL,
+    AUTOFIX_PENDING_LABEL,
+    AUTOFIX_STARTED_LABEL,
+    SRE_LABEL,
+    Incident,
+    SREService,
+    issue_title,
+)
 from homelab_sre_agent.state import StateStore
 
 
@@ -33,6 +43,17 @@ class FakeLogs(DockerLogCollector):
         since=None,
     ) -> str:
         return self.text
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.current = datetime(2026, 5, 9, 5, 0, tzinfo=timezone.utc)
+
+    def now(self) -> datetime:
+        return self.current
+
+    def advance(self, seconds: int) -> None:
+        self.current += timedelta(seconds=seconds)
 
 
 class FakeGitHub(GitHubClient):
@@ -56,6 +77,15 @@ class FakeGitHub(GitHubClient):
             {"action": "create_issue", "repo": repo, "title": title, "body": body, "labels": labels}
         )
         return IssueResult(repo=repo, number=issue.number, url=issue.url)
+
+    def find_open_issue_by_title(self, *, repo: str, title: str, label: str | None = None) -> IssueResult | None:
+        for issue in self.issues.values():
+            if issue.repo != repo or issue.title != title:
+                continue
+            if label is not None and label not in issue.labels:
+                continue
+            return IssueResult(repo=repo, number=issue.number, url=issue.url)
+        return None
 
     def list_open_issues_with_label(self, *, repo: str, label: str) -> list[GitHubIssue]:
         return [issue for issue in self.issues.values() if issue.repo == repo and label in issue.labels]
@@ -92,6 +122,12 @@ class FakeGitHub(GitHubClient):
         self.ensured_labels.append((repo, name))
 
 
+class SlowFakeGitHub(FakeGitHub):
+    def create_issue(self, *, repo: str, title: str, body: str, labels: list[str]) -> IssueResult:
+        time.sleep(0.05)
+        return super().create_issue(repo=repo, title=title, body=body, labels=labels)
+
+
 class FakeNotifier:
     def __init__(self) -> None:
         self.calls = []
@@ -107,6 +143,7 @@ def make_config(
     dry_run: bool = True,
     episode_window_seconds: int = 120,
     investigation_cooldown_seconds: int = 86400,
+    issue_comment_cooldown_seconds: int = 3600,
     issue_notifications_enabled: bool = False,
     phone_approvals_enabled: bool = False,
 ) -> Config:
@@ -125,6 +162,7 @@ def make_config(
         episode_window_seconds=episode_window_seconds,
         diagnostic_max_bytes=1_000_000,
         investigation_cooldown_seconds=investigation_cooldown_seconds,
+        issue_comment_cooldown_seconds=issue_comment_cooldown_seconds,
         codex_global_daily_limit=3,
         approval_poll_seconds=300,
         issue_notifications_enabled=issue_notifications_enabled,
@@ -203,10 +241,12 @@ class ServiceTests(TestCase):
         logs: str = "ERROR token=abc failed",
         episode_window_seconds: int = 120,
         investigation_cooldown_seconds: int = 86400,
+        issue_comment_cooldown_seconds: int = 3600,
         github: GitHubClient | None = None,
         issue_notifier=None,
         issue_notifications_enabled: bool = False,
         phone_approvals_enabled: bool = False,
+        now_func=None,
     ):
         tmp = tempfile.TemporaryDirectory()
         path = Path(tmp.name)
@@ -215,6 +255,7 @@ class ServiceTests(TestCase):
             path,
             episode_window_seconds=episode_window_seconds,
             investigation_cooldown_seconds=investigation_cooldown_seconds,
+            issue_comment_cooldown_seconds=issue_comment_cooldown_seconds,
             issue_notifications_enabled=issue_notifications_enabled,
             phone_approvals_enabled=phone_approvals_enabled,
         )
@@ -227,6 +268,7 @@ class ServiceTests(TestCase):
             github=github,
             logs=FakeLogs(logs),
             issue_notifier=issue_notifier,
+            now_func=now_func,
         )
         return tmp, service, github
 
@@ -304,7 +346,8 @@ services:
         self.assertEqual(result["reason"], "sre disabled")
         self.assertEqual(github.dry_run_actions, [])
 
-    def test_duplicate_fingerprint_comments_existing_issue(self) -> None:
+    def test_repeated_incidents_are_bundled_after_comment_cooldown(self) -> None:
+        clock = FakeClock()
         tmp, service, github = self.make_service(
             """
 services:
@@ -314,14 +357,92 @@ services:
       repo: feocco/plant-monitor
     sre:
       enabled: true
-"""
+""",
+            now_func=clock.now,
         )
         self.addCleanup(tmp.cleanup)
 
-        service.handle_incident(payload())
-        service.handle_incident(payload())
+        service.handle_incident(payload(fingerprint="fingerprint-one"))
+        service.handle_incident(payload(fingerprint="fingerprint-two"))
+        service.handle_incident(payload(fingerprint="fingerprint-three"))
+        clock.advance(3601)
+        service.handle_incident(payload(fingerprint="fingerprint-four"))
 
         self.assertEqual([action["action"] for action in github.dry_run_actions], ["create_issue", "comment_issue"])
+        self.assertIn("Observed 3 more times since the last update.", github.dry_run_actions[-1]["body"])
+
+    def test_concurrent_same_issue_key_creates_one_issue(self) -> None:
+        github = SlowFakeGitHub()
+        tmp, service, github = self.make_service(
+            """
+services:
+  plant-monitor:
+    containers: [plant-monitor]
+    source:
+      repo: feocco/plant-monitor
+    sre:
+      enabled: true
+""",
+            github=github,
+        )
+        self.addCleanup(tmp.cleanup)
+        results = []
+        errors = []
+
+        def handle() -> None:
+            try:
+                results.append(service.handle_incident(payload()))
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=handle) for _ in range(3)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 3)
+        self.assertEqual([action["action"] for action in github.dry_run_actions].count("create_issue"), 1)
+
+    def test_existing_open_issue_with_same_title_is_reused(self) -> None:
+        github = FakeGitHub()
+        tmp, service, github = self.make_service(
+            """
+services:
+  plant-monitor:
+    containers: [plant-monitor]
+    source:
+      repo: feocco/plant-monitor
+    sre:
+      enabled: true
+""",
+            github=github,
+        )
+        self.addCleanup(tmp.cleanup)
+        incident = Incident.from_payload(payload())
+        catalog = service._catalog()
+        source = catalog.services[0]
+        state_key = service._state_key(
+            source,
+            incident,
+            "ERROR token=abc failed",
+            datetime(2026, 5, 9, 5, 0, tzinfo=timezone.utc),
+        )
+        title = issue_title(source, incident, state_key)
+        github.issues[("feocco/plant-monitor", 99)] = GitHubIssue(
+            repo="feocco/plant-monitor",
+            number=99,
+            url="https://github.com/feocco/plant-monitor/issues/99",
+            title=title,
+            labels=(SRE_LABEL,),
+        )
+
+        result = service.handle_incident(payload())
+
+        self.assertEqual(result["status"], "reused")
+        self.assertEqual(result["issue"]["number"], 99)
+        self.assertNotIn("create_issue", [action["action"] for action in github.dry_run_actions])
 
     def test_autofix_requires_approval_and_poll_dispatches(self) -> None:
         github = FakeGitHub()
@@ -602,6 +723,7 @@ services:
         self.assertIn("Relevant redacted log line:", body)
         self.assertIn("HA_LONG_LIVED_TOKEN=<redacted>", body)
         self.assertIn("Full local diagnostic bundle: `/nas/diagnostics/plant-monitor/", body)
+        self.assertIn("SRE state fingerprint:", body)
         self.assertNotIn("## Recent Logs", body)
 
     def test_traceback_lines_within_episode_update_existing_issue(self) -> None:
@@ -615,14 +737,25 @@ services:
     sre:
       enabled: true
 """,
+            episode_window_seconds=0,
             logs="ERROR request failed\nTraceback\nNameError: name 'CANARY_STATUS' is not defined",
         )
         self.addCleanup(tmp.cleanup)
 
-        service.handle_incident(payload(fingerprint="fingerprint-one"))
-        service.handle_incident(payload(fingerprint="fingerprint-two"))
+        traceback_payload = payload(fingerprint="fingerprint-two")
+        traceback_payload["incident"]["matched_pattern"] = "Traceback"
+        traceback_payload["incident"]["line"] = "Traceback (most recent call last):"
+        traceback_payload["incident"]["normalized_line"] = "traceback most recent call last"
+        exception_payload = payload(fingerprint="fingerprint-three")
+        exception_payload["incident"]["matched_pattern"] = "Exception"
+        exception_payload["incident"]["line"] = "NameError: name 'CANARY_STATUS' is not defined"
+        exception_payload["incident"]["normalized_line"] = "nameerror name <id> is not defined"
 
-        self.assertEqual([action["action"] for action in github.dry_run_actions], ["create_issue", "comment_issue"])
+        service.handle_incident(payload(fingerprint="fingerprint-one"))
+        service.handle_incident(traceback_payload)
+        service.handle_incident(exception_payload)
+
+        self.assertEqual([action["action"] for action in github.dry_run_actions], ["create_issue"])
         body = github.dry_run_actions[0]["body"]
         self.assertIn("hit `NameError`", body)
         self.assertIn("name 'CANARY_STATUS' is not defined", body)

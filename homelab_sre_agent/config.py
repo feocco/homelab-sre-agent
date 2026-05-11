@@ -21,6 +21,7 @@ class Config:
     episode_window_seconds: int
     diagnostic_max_bytes: int
     investigation_cooldown_seconds: int
+    issue_comment_cooldown_seconds: int
     codex_global_daily_limit: int
     approval_poll_seconds: int
     issue_notifications_enabled: bool
@@ -49,6 +50,7 @@ class Config:
             episode_window_seconds=parse_int("SRE_EPISODE_WINDOW_SECONDS", 120),
             diagnostic_max_bytes=parse_int("SRE_DIAGNOSTIC_MAX_BYTES", 1_000_000),
             investigation_cooldown_seconds=parse_int("SRE_INVESTIGATION_COOLDOWN_SECONDS", 86400),
+            issue_comment_cooldown_seconds=parse_int("SRE_ISSUE_COMMENT_COOLDOWN_SECONDS", 3600),
             codex_global_daily_limit=parse_int("SRE_CODEX_GLOBAL_DAILY_LIMIT", 3),
             approval_poll_seconds=parse_int("SRE_APPROVAL_POLL_SECONDS", 300),
             issue_notifications_enabled=parse_bool(os.environ.get("SRE_ISSUE_NOTIFICATIONS_ENABLED"), False),

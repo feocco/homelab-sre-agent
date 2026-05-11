@@ -53,6 +53,22 @@ class GitHubClient:
             return
         self._request("POST", f"/repos/{repo_path(repo)}/issues/{issue_number}/comments", {"body": body})
 
+    def find_open_issue_by_title(self, *, repo: str, title: str, label: str | None = None) -> IssueResult | None:
+        if self.dry_run:
+            return None
+        query = f"/repos/{repo_path(repo)}/issues?state=open&per_page=100"
+        if label:
+            query += f"&labels={quote(label, safe='')}"
+        response = self._request("GET", query, None)
+        if not isinstance(response, list):
+            raise RuntimeError("GitHub API returned a non-list issue response")
+        for item in response:
+            if not isinstance(item, dict) or "pull_request" in item:
+                continue
+            if str(item.get("title") or "") == title:
+                return IssueResult(repo=repo, number=int(item["number"]), url=str(item["html_url"]))
+        return None
+
     def repository_dispatch(self, *, repo: str, event_type: str, client_payload: dict[str, Any]) -> None:
         if self.dry_run:
             self.dry_run_actions.append(

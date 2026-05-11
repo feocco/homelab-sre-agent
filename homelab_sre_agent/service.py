@@ -14,11 +14,12 @@ from .github import GitHubClient, GitHubIssue, IssueResult
 from .metadata import ServiceCatalog, ServiceMetadata
 from .notifications import IssueNotifier, PHONE_APPROVAL_TOKEN_TTL_SECONDS, make_approval_action
 from .redact import redact_text
-from .state import StateStore, utc_now
+from .state import CommentRollup, StateStore, utc_now
 
 
 LOGGER = logging.getLogger("homelab-sre-agent")
 MAX_PUBLIC_LINE_CHARS = 1000
+ISSUE_CREATE_CLAIM_TTL_SECONDS = 300
 EXCEPTION_RE = re.compile(r"\b([A-Za-z_][\w.]*Error|Exception):\s+(.+)")
 AUTOFIX_PENDING_LABEL = "sre:autofix-pending"
 AUTOFIX_APPROVED_LABEL = "sre:autofix-approved"
@@ -98,6 +99,7 @@ class SREService:
         github: GitHubClient,
         logs: DockerLogCollector,
         issue_notifier: IssueNotifier | None = None,
+        now_func: Callable[[], datetime] | None = None,
     ) -> None:
         self.config = config
         if catalog is None and catalog_loader is None:
@@ -108,9 +110,10 @@ class SREService:
         self.github = github
         self.logs = logs
         self.issue_notifier = issue_notifier
+        self.now_func = now_func or utc_now
 
     def handle_incident(self, payload: dict[str, Any]) -> dict[str, Any]:
-        now = utc_now()
+        now = self.now_func()
         incident = Incident.from_payload(payload)
         service = self._catalog().match(container_name=incident.container_name, image=incident.image)
 
@@ -122,38 +125,68 @@ class SREService:
         analysis = analyze_incident(incident, raw_logs)
         sanitized_line = redact_text(analysis.representative_line, limit=MAX_PUBLIC_LINE_CHARS)
         state_key = self._state_key(service, incident, raw_logs, now)
-        record = self.state.record_seen(
+        claim = self.state.claim_issue_for_incident(
             fingerprint=state_key,
             service_name=service.name,
             issue_repo=service.issue_repo,
             now=now,
+            claim_ttl_seconds=ISSUE_CREATE_CLAIM_TTL_SECONDS,
         )
 
         title = issue_title(service, incident, state_key)
         labels = sorted(set(service.labels + (SRE_LABEL, incident.severity.lower()) + self._autofix_pending_labels(service)))
-        if record.issue_number is None:
+        if claim.action == "create_issue":
             self._ensure_service_labels(service, labels)
-            issue = self.github.create_issue(
-                repo=service.issue_repo,
-                title=title,
-                body=issue_body(service, incident, analysis, sanitized_line, bundle, self.config.dry_run),
-                labels=labels,
-            )
-            self.state.set_issue(fingerprint=state_key, issue_number=issue.number, issue_url=issue.url)
+            issue = self.github.find_open_issue_by_title(repo=service.issue_repo, title=title, label=SRE_LABEL)
+            issue_action = "reused"
+            if issue is None:
+                try:
+                    issue = self.github.create_issue(
+                        repo=service.issue_repo,
+                        title=title,
+                        body=issue_body(service, incident, analysis, sanitized_line, bundle, self.config.dry_run, state_key),
+                        labels=labels,
+                    )
+                except Exception:
+                    self.state.fail_issue_claim(fingerprint=state_key, now=now)
+                    raise
+                issue_action = "created"
             issue_result = issue
-            self._notify_issue_created(service, incident, analysis, sanitized_line, state_key, issue, now)
-            issue_action = "created"
+            self.state.set_issue(fingerprint=state_key, issue_number=issue.number, issue_url=issue.url, now=now)
+            if issue_action == "created":
+                self._notify_issue_created(service, incident, analysis, sanitized_line, state_key, issue, now)
+        elif claim.action == "issue_creation_in_flight":
+            dispatch = self._autofix_wait_status(service)
+            LOGGER.info("Deferred issue update for %s fingerprint=%s", service.name, incident.fingerprint[:12])
+            return {
+                "ok": True,
+                "status": "issue_creation_in_flight",
+                "service": service.name,
+                "issue": None,
+                "dispatch": dispatch,
+                "diagnostic": {"path": bundle.path, "reference": bundle.reference},
+                "dry_run": self.config.dry_run,
+            }
         else:
             issue_result = IssueResult(
                 repo=service.issue_repo,
-                number=record.issue_number,
-                url=record.issue_url or f"https://github.com/{service.issue_repo}/issues/{record.issue_number}",
+                number=claim.record.issue_number or 0,
+                url=claim.record.issue_url or f"https://github.com/{service.issue_repo}/issues/{claim.record.issue_number}",
             )
-            self.github.comment_issue(
-                repo=service.issue_repo,
-                issue_number=record.issue_number,
-                body=issue_comment(incident, sanitized_line, bundle),
+            rollup = self.state.record_pending_comment(
+                fingerprint=state_key,
+                now=now,
+                line=sanitized_line,
+                bundle_reference=bundle.reference,
+                cooldown_seconds=self.config.issue_comment_cooldown_seconds,
             )
+            if rollup is not None and claim.record.issue_number is not None:
+                self.github.comment_issue(
+                    repo=service.issue_repo,
+                    issue_number=claim.record.issue_number,
+                    body=issue_comment(rollup),
+                )
+                self.state.mark_comment_sent(fingerprint=state_key, now=now)
             pending_labels = self._autofix_pending_labels(service)
             if pending_labels and not self.state.recent_dispatch_exists(
                 fingerprint=state_key,
@@ -162,7 +195,7 @@ class SREService:
                 self._ensure_service_labels(service, pending_labels)
                 self.github.add_issue_labels(
                     repo=service.issue_repo,
-                    issue_number=record.issue_number,
+                    issue_number=claim.record.issue_number or 0,
                     labels=list(pending_labels),
                 )
             issue_action = "updated"
@@ -253,14 +286,27 @@ class SREService:
                 return recent.fingerprint
 
         analysis = analyze_incident(incident, raw_logs)
-        signature = "|".join(
-            [
-                service.name,
-                incident.container_name,
-                incident.severity,
-                normalize_for_key(analysis.representative_line),
-            ]
-        )
+        clean_line = strip_log_timestamp(analysis.representative_line)
+        exception = EXCEPTION_RE.search(clean_line)
+        if exception:
+            signature = "|".join(
+                [
+                    service.name,
+                    incident.container_name,
+                    "exception",
+                    exception.group(1),
+                    normalize_for_key(exception.group(2)),
+                ]
+            )
+        else:
+            signature = "|".join(
+                [
+                    service.name,
+                    incident.container_name,
+                    incident.severity,
+                    normalize_for_key(analysis.representative_line),
+                ]
+            )
         digest = hashlib.sha256(signature.encode("utf-8")).hexdigest()
         return f"episode:{service.name}:{digest}"
 
@@ -510,6 +556,7 @@ def issue_body(
     sanitized_line: str,
     bundle: DiagnosticBundle,
     dry_run: bool,
+    state_key: str,
 ) -> str:
     return "\n".join(
         [
@@ -529,6 +576,7 @@ def issue_body(
             "",
             "## Incident",
             "",
+            f"- SRE state fingerprint: `{state_key}`",
             f"- Fingerprint: `{incident.fingerprint}`",
             f"- Occurred at: `{incident.occurred_at}`",
             f"- Detected at: `{incident.detected_at}`",
@@ -555,15 +603,15 @@ def issue_body(
     )
 
 
-def issue_comment(incident: Incident, sanitized_line: str, bundle: DiagnosticBundle) -> str:
+def issue_comment(rollup: CommentRollup) -> str:
     return "\n".join(
         [
-            "The same incident episode was observed again.",
+            f"Observed {rollup.count} more times since the last update.",
             "",
-            f"- Occurred at: `{incident.occurred_at}`",
-            f"- Detected at: `{incident.detected_at}`",
-            f"- Relevant redacted log line: `{sanitized_line}`",
-            f"- Full local diagnostic bundle: `{bundle.reference}`",
+            f"- First repeated observation: `{rollup.first_seen_at}`",
+            f"- Latest repeated observation: `{rollup.last_seen_at}`",
+            f"- Latest redacted log line: `{rollup.line}`",
+            f"- Latest local diagnostic bundle: `{rollup.bundle_reference}`",
         ]
     )
 
