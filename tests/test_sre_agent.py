@@ -19,8 +19,10 @@ from homelab_sre_agent.notifications import (
 from homelab_sre_agent.redact import redact_text
 from homelab_sre_agent.service import (
     AUTOFIX_APPROVED_LABEL,
+    AUTOFIX_BLOCKED_LABEL,
     AUTOFIX_PENDING_LABEL,
     AUTOFIX_STARTED_LABEL,
+    HUMAN_INVESTIGATING_LABEL,
     SRE_LABEL,
     Incident,
     SREService,
@@ -146,6 +148,7 @@ def make_config(
     issue_comment_cooldown_seconds: int = 3600,
     issue_notifications_enabled: bool = False,
     phone_approvals_enabled: bool = False,
+    codex_global_daily_limit: int = 3,
 ) -> Config:
     return Config(
         state_path=path / "state.sqlite3",
@@ -163,7 +166,7 @@ def make_config(
         diagnostic_max_bytes=1_000_000,
         investigation_cooldown_seconds=investigation_cooldown_seconds,
         issue_comment_cooldown_seconds=issue_comment_cooldown_seconds,
-        codex_global_daily_limit=3,
+        codex_global_daily_limit=codex_global_daily_limit,
         approval_poll_seconds=300,
         issue_notifications_enabled=issue_notifications_enabled,
         phone_approvals_enabled=phone_approvals_enabled,
@@ -246,6 +249,7 @@ class ServiceTests(TestCase):
         issue_notifier=None,
         issue_notifications_enabled: bool = False,
         phone_approvals_enabled: bool = False,
+        codex_global_daily_limit: int = 3,
         now_func=None,
     ):
         tmp = tempfile.TemporaryDirectory()
@@ -258,6 +262,7 @@ class ServiceTests(TestCase):
             issue_comment_cooldown_seconds=issue_comment_cooldown_seconds,
             issue_notifications_enabled=issue_notifications_enabled,
             phone_approvals_enabled=phone_approvals_enabled,
+            codex_global_daily_limit=codex_global_daily_limit,
         )
         catalog = load_catalog(config.service_metadata_path, default_issue_repo=config.default_issue_repo)
         github = github or GitHubClient(token=None, api_url=config.github_api_url, dry_run=True, timeout_seconds=10)
@@ -370,6 +375,7 @@ services:
 
         self.assertEqual([action["action"] for action in github.dry_run_actions], ["create_issue", "comment_issue"])
         self.assertIn("Observed 3 more times since the last update.", github.dry_run_actions[-1]["body"])
+        self.assertIn("**homelab-sre-agent**", github.dry_run_actions[-1]["body"])
 
     def test_concurrent_same_issue_key_creates_one_issue(self) -> None:
         github = SlowFakeGitHub()
@@ -468,7 +474,7 @@ services:
         issue_key = ("feocco/plant-monitor", result["issue"]["number"])
 
         self.assertEqual(result["dispatch"]["reason"], "autofix approval required")
-        self.assertIn(AUTOFIX_PENDING_LABEL, github.issues[issue_key].labels)
+        self.assertNotIn(AUTOFIX_PENDING_LABEL, github.issues[issue_key].labels)
         self.assertNotIn("repository_dispatch", [action["action"] for action in github.dry_run_actions])
 
         github.add_issue_labels(repo=issue_key[0], issue_number=issue_key[1], labels=[AUTOFIX_APPROVED_LABEL])
@@ -476,9 +482,11 @@ services:
 
         self.assertEqual(poll_result["processed"], 1)
         self.assertIn("repository_dispatch", [action["action"] for action in github.dry_run_actions])
-        self.assertIn(AUTOFIX_STARTED_LABEL, github.issues[issue_key].labels)
+        self.assertNotIn(AUTOFIX_STARTED_LABEL, github.issues[issue_key].labels)
         self.assertNotIn(AUTOFIX_APPROVED_LABEL, github.issues[issue_key].labels)
         self.assertNotIn(AUTOFIX_PENDING_LABEL, github.issues[issue_key].labels)
+        self.assertIn("sent `repository_dispatch`", github.dry_run_actions[-1]["body"])
+        self.assertIn("**homelab-sre-agent**", github.dry_run_actions[-1]["body"])
 
     def test_new_issue_sends_phone_notification_with_approval_button(self) -> None:
         github = FakeGitHub()
@@ -591,6 +599,7 @@ services:
         self.assertIn(AUTOFIX_APPROVED_LABEL, github.issues[issue_key].labels)
         self.assertEqual(github.dry_run_actions[-1]["action"], "comment_issue")
         self.assertIn("Autofix approved from the phone notification", github.dry_run_actions[-1]["body"])
+        self.assertIn("**homelab-sre-agent**", github.dry_run_actions[-1]["body"])
 
         duplicate_result = service.approve_autofix_from_phone(token)
         self.assertEqual(duplicate_result["status"], "ignored")
@@ -653,6 +662,10 @@ services:
 
         service.ensure_autofix_labels()
         self.assertIn(("feocco/plant-monitor", AUTOFIX_APPROVED_LABEL), github.ensured_labels)
+        self.assertIn(("feocco/plant-monitor", HUMAN_INVESTIGATING_LABEL), github.ensured_labels)
+        self.assertNotIn(("feocco/plant-monitor", AUTOFIX_PENDING_LABEL), github.ensured_labels)
+        self.assertNotIn(("feocco/plant-monitor", AUTOFIX_STARTED_LABEL), github.ensured_labels)
+        self.assertNotIn(("feocco/plant-monitor", AUTOFIX_BLOCKED_LABEL), github.ensured_labels)
 
         github.ensured_labels.clear()
         poll_result = service.poll_autofix_approvals()
@@ -700,6 +713,45 @@ services:
 
         self.assertEqual(poll_result["results"][0]["status"], "blocked")
         self.assertEqual(poll_result["results"][0]["reason"], "repo daily limit")
+        self.assertNotIn(AUTOFIX_BLOCKED_LABEL, github.issues[second_issue_key].labels)
+        self.assertNotIn(AUTOFIX_APPROVED_LABEL, github.issues[second_issue_key].labels)
+        self.assertIn("per-repo Codex dispatch cap", github.dry_run_actions[-1]["body"])
+        self.assertIn("**homelab-sre-agent**", github.dry_run_actions[-1]["body"])
+
+    def test_approved_autofix_obeys_global_daily_limit_with_explanatory_comment(self) -> None:
+        github = FakeGitHub()
+        tmp, service, github = self.make_service(
+            """
+services:
+  plant-monitor:
+    containers: [plant-monitor]
+    source:
+      repo: feocco/plant-monitor
+    sre:
+      enabled: true
+      autofix: true
+      repo_daily_limit: 5
+""",
+            episode_window_seconds=0,
+            investigation_cooldown_seconds=0,
+            codex_global_daily_limit=0,
+            github=github,
+        )
+        self.addCleanup(tmp.cleanup)
+
+        result = service.handle_incident(payload(fingerprint="fingerprint-one"))
+        issue_key = ("feocco/plant-monitor", result["issue"]["number"])
+        github.add_issue_labels(repo=issue_key[0], issue_number=issue_key[1], labels=[AUTOFIX_APPROVED_LABEL])
+
+        poll_result = service.poll_autofix_approvals()
+
+        self.assertEqual(poll_result["results"][0]["status"], "blocked")
+        self.assertEqual(poll_result["results"][0]["reason"], "global daily limit")
+        self.assertNotIn(AUTOFIX_BLOCKED_LABEL, github.issues[issue_key].labels)
+        self.assertNotIn(AUTOFIX_APPROVED_LABEL, github.issues[issue_key].labels)
+        self.assertIn("global Codex dispatch cap", github.dry_run_actions[-1]["body"])
+        self.assertIn("SRE_CODEX_GLOBAL_DAILY_LIMIT", github.dry_run_actions[-1]["body"])
+        self.assertIn("**homelab-sre-agent**", github.dry_run_actions[-1]["body"])
 
     def test_issue_body_uses_summary_and_local_diagnostic_reference(self) -> None:
         tmp, service, github = self.make_service(

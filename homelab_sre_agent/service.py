@@ -27,11 +27,10 @@ AUTOFIX_STARTED_LABEL = "sre:autofix-started"
 AUTOFIX_BLOCKED_LABEL = "sre:autofix-blocked"
 HUMAN_INVESTIGATING_LABEL = "sre:human-investigating"
 SRE_LABEL = "homelab-sre"
+AGENT_COMMENT_HEADER = "**homelab-sre-agent**"
+LEGACY_AUTOFIX_STATUS_LABELS = (AUTOFIX_PENDING_LABEL, AUTOFIX_STARTED_LABEL, AUTOFIX_BLOCKED_LABEL)
 AUTOFIX_LABELS = {
-    AUTOFIX_PENDING_LABEL: ("fef3c7", "SRE autofix is available but waiting for approval."),
     AUTOFIX_APPROVED_LABEL: ("bbf7d0", "Approval for the homelab SRE agent to dispatch Codex."),
-    AUTOFIX_STARTED_LABEL: ("bfdbfe", "The homelab SRE agent dispatched Codex for this issue."),
-    AUTOFIX_BLOCKED_LABEL: ("fecaca", "The homelab SRE agent could not dispatch Codex for this issue."),
     HUMAN_INVESTIGATING_LABEL: ("ddd6fe", "A human is investigating; SRE autofix should not start."),
 }
 
@@ -134,7 +133,7 @@ class SREService:
         )
 
         title = issue_title(service, incident, state_key)
-        labels = sorted(set(service.labels + (SRE_LABEL, incident.severity.lower()) + self._autofix_pending_labels(service)))
+        labels = sorted(set(service.labels + (SRE_LABEL, incident.severity.lower())))
         if claim.action == "create_issue":
             self._ensure_service_labels(service, labels)
             issue = self.github.find_open_issue_by_title(repo=service.issue_repo, title=title, label=SRE_LABEL)
@@ -184,20 +183,9 @@ class SREService:
                 self.github.comment_issue(
                     repo=service.issue_repo,
                     issue_number=claim.record.issue_number,
-                    body=issue_comment(rollup),
+                    body=agent_comment(issue_comment(rollup)),
                 )
                 self.state.mark_comment_sent(fingerprint=state_key, now=now)
-            pending_labels = self._autofix_pending_labels(service)
-            if pending_labels and not self.state.recent_dispatch_exists(
-                fingerprint=state_key,
-                since=now - timedelta(seconds=self.config.investigation_cooldown_seconds),
-            ):
-                self._ensure_service_labels(service, pending_labels)
-                self.github.add_issue_labels(
-                    repo=service.issue_repo,
-                    issue_number=claim.record.issue_number or 0,
-                    labels=list(pending_labels),
-                )
             issue_action = "updated"
 
         dispatch = self._autofix_wait_status(service)
@@ -387,7 +375,9 @@ class SREService:
         self.github.comment_issue(
             repo=approval.issue_repo,
             issue_number=approval.issue_number,
-            body="Autofix approved from the phone notification. The SRE agent will run normal safety gates before dispatching Codex.",
+            body=agent_comment(
+                "Autofix approved from the phone notification. The SRE agent will run normal safety gates before dispatching Codex."
+            ),
         )
         return {
             "ok": True,
@@ -416,7 +406,7 @@ class SREService:
             return self._block_autofix(
                 issue,
                 reason="no matching incident state",
-                comment="Autofix approval was blocked because this issue does not map to local SRE incident state.",
+                comment=self._autofix_block_comment(reason="no matching incident state"),
             )
 
         service = next(
@@ -427,11 +417,27 @@ class SREService:
             return self._block_autofix(
                 issue,
                 reason="service metadata missing",
-                comment=f"Autofix approval was blocked because service `{record.service_name}` is no longer in SRE metadata.",
+                comment=self._autofix_block_comment(
+                    reason="service metadata missing",
+                    service_name=record.service_name,
+                ),
             )
 
         issue_result = IssueResult(repo=issue.repo, number=issue.number, url=issue.url)
-        dispatch = self._dispatch_codex_for_issue(service, issue_result, record.fingerprint, now)
+        try:
+            dispatch = self._dispatch_codex_for_issue(service, issue_result, record.fingerprint, now)
+        except Exception as exc:
+            LOGGER.exception("Autofix dispatch failed for %s#%s", issue.repo, issue.number)
+            return self._block_autofix(
+                issue,
+                reason="dispatch error",
+                comment=self._autofix_block_comment(
+                    reason="dispatch error",
+                    service_name=service.name,
+                    source_repo=service.source_repo,
+                    detail=redact_text(str(exc), limit=MAX_PUBLIC_LINE_CHARS),
+                ),
+            )
         if dispatch.get("attempted"):
             self._mark_autofix_started(issue, dispatch)
             return {"issue": issue.number, "status": "dispatched", "dispatch": dispatch}
@@ -444,26 +450,135 @@ class SREService:
         return self._block_autofix(
             issue,
             reason=reason,
-            comment=f"Autofix approval was blocked by SRE safety gate: `{reason}`.",
+            comment=self._autofix_block_comment(
+                reason=reason,
+                service_name=service.name,
+                source_repo=service.source_repo,
+                repo_daily_limit=service.repo_daily_limit,
+            ),
         )
 
     def _mark_autofix_started(self, issue: GitHubIssue, dispatch: dict[str, Any]) -> None:
-        self._ensure_labels(issue.repo, (AUTOFIX_STARTED_LABEL,))
-        self.github.add_issue_labels(repo=issue.repo, issue_number=issue.number, labels=[AUTOFIX_STARTED_LABEL])
-        self.github.remove_issue_label(repo=issue.repo, issue_number=issue.number, label=AUTOFIX_APPROVED_LABEL)
-        self.github.remove_issue_label(repo=issue.repo, issue_number=issue.number, label=AUTOFIX_PENDING_LABEL)
-        branch = dispatch.get("branch")
-        body = "Autofix approval accepted. Codex investigation has been dispatched."
-        if branch:
-            body += f"\n\nExpected branch: `{branch}`"
-        self.github.comment_issue(repo=issue.repo, issue_number=issue.number, body=body)
+        self._remove_autofix_control_labels(issue)
+        self.github.comment_issue(repo=issue.repo, issue_number=issue.number, body=self._autofix_dispatch_comment(dispatch))
 
     def _block_autofix(self, issue: GitHubIssue, *, reason: str, comment: str) -> dict[str, Any]:
-        self._ensure_labels(issue.repo, (AUTOFIX_BLOCKED_LABEL,))
-        self.github.add_issue_labels(repo=issue.repo, issue_number=issue.number, labels=[AUTOFIX_BLOCKED_LABEL])
-        self.github.remove_issue_label(repo=issue.repo, issue_number=issue.number, label=AUTOFIX_APPROVED_LABEL)
+        self._remove_autofix_control_labels(issue)
         self.github.comment_issue(repo=issue.repo, issue_number=issue.number, body=comment)
         return {"issue": issue.number, "status": "blocked", "reason": reason}
+
+    def _remove_autofix_control_labels(self, issue: GitHubIssue) -> None:
+        self.github.remove_issue_label(repo=issue.repo, issue_number=issue.number, label=AUTOFIX_APPROVED_LABEL)
+        for label in LEGACY_AUTOFIX_STATUS_LABELS:
+            self.github.remove_issue_label(repo=issue.repo, issue_number=issue.number, label=label)
+
+    def _autofix_dispatch_comment(self, dispatch: dict[str, Any]) -> str:
+        branch = dispatch.get("branch")
+        reason = str(dispatch.get("reason") or "")
+        if dispatch.get("attempted"):
+            lines = [
+                "Autofix approval accepted.",
+                "",
+                "- Result: sent `repository_dispatch` to the source repo.",
+                f"- Source repo: `{dispatch.get('repo')}`",
+                f"- Event type: `{dispatch.get('event_type')}`",
+            ]
+            if branch:
+                lines.append(f"- Expected branch: `{branch}`")
+            return agent_comment("\n".join(lines))
+
+        if reason == "open SRE PR":
+            lines = [
+                "Autofix approval accepted, but no new Codex workflow was dispatched.",
+                "",
+                "- Reason: an open SRE pull request already exists for this issue.",
+            ]
+            if branch:
+                lines.append(f"- Existing branch: `{branch}`")
+            return agent_comment("\n".join(lines))
+
+        if reason == "investigation cooldown":
+            return agent_comment(
+                "\n".join(
+                    [
+                        "Autofix approval accepted, but no new Codex workflow was dispatched.",
+                        "",
+                        "- Reason: this issue is still inside the investigation cooldown for this incident fingerprint.",
+                        f"- Cooldown: `{self.config.investigation_cooldown_seconds}` seconds.",
+                    ]
+                )
+            )
+
+        return agent_comment(
+            "\n".join(
+                [
+                    "Autofix approval accepted, but no new Codex workflow was dispatched.",
+                    "",
+                    f"- Reason: `{reason or 'unknown'}`",
+                ]
+            )
+        )
+
+    def _autofix_block_comment(
+        self,
+        *,
+        reason: str,
+        service_name: str | None = None,
+        source_repo: str | None = None,
+        repo_daily_limit: int | None = None,
+        detail: str | None = None,
+    ) -> str:
+        lines = [
+            "Autofix approval was not dispatched.",
+            "",
+            f"- Reason: `{reason}`",
+        ]
+        if service_name:
+            lines.append(f"- Service: `{service_name}`")
+        if source_repo:
+            lines.append(f"- Source repo: `{source_repo}`")
+
+        if reason == "global daily limit":
+            lines.extend(
+                [
+                    "- What happened: the SRE agent already reached its global Codex dispatch cap for today.",
+                    f"- Current limit: `{self.config.codex_global_daily_limit}` dispatch(es) per UTC day via `SRE_CODEX_GLOBAL_DAILY_LIMIT`.",
+                    "- Retry: wait until the next UTC day, or raise the global limit and apply `sre:autofix-approved` again.",
+                ]
+            )
+        elif reason == "repo daily limit":
+            limit = repo_daily_limit if repo_daily_limit is not None else "unknown"
+            lines.extend(
+                [
+                    "- What happened: this source repo already reached its per-repo Codex dispatch cap for today.",
+                    f"- Current limit: `{limit}` dispatch(es) per UTC day from service metadata.",
+                    "- Retry: wait until the next UTC day, or raise the service `repo_daily_limit` and apply `sre:autofix-approved` again.",
+                ]
+            )
+        elif reason == "autofix disabled":
+            lines.append("- What happened: service metadata does not opt this service into Codex autofix.")
+        elif reason == "source repo missing":
+            lines.append("- What happened: service metadata does not include a source repo to dispatch the workflow into.")
+        elif reason == "unknown service":
+            lines.append("- What happened: the incident did not match an enabled service metadata entry.")
+        elif reason == "no matching incident state":
+            lines.extend(
+                [
+                    "- What happened: the GitHub issue could not be matched to local SRE SQLite state on the NAS.",
+                    "- Retry: wait for a fresh incident update, or recreate the issue through the SRE incident flow.",
+                ]
+            )
+        elif reason == "service metadata missing":
+            lines.append("- What happened: the issue maps to a service that is no longer present in SRE metadata.")
+        elif reason == "dispatch error":
+            lines.append("- What happened: the agent attempted to dispatch the GitHub workflow and the call failed.")
+        else:
+            lines.append("- What happened: a safety gate prevented the Codex workflow from starting.")
+
+        if detail:
+            lines.append(f"- Error detail: `{detail}`")
+        lines.append("- Result: no Codex workflow was triggered.")
+        return agent_comment("\n".join(lines))
 
     def _autofix_wait_status(self, service: ServiceMetadata) -> dict[str, Any]:
         if service.unknown:
@@ -478,14 +593,12 @@ class SREService:
             "approval_label": AUTOFIX_APPROVED_LABEL,
         }
 
-    def _autofix_pending_labels(self, service: ServiceMetadata) -> tuple[str, ...]:
-        if service.unknown or not service.autofix or not service.source_repo:
-            return ()
-        return (AUTOFIX_PENDING_LABEL,)
+    def _autofix_eligible(self, service: ServiceMetadata) -> bool:
+        return not service.unknown and service.autofix and bool(service.source_repo)
 
     def _ensure_service_labels(self, service: ServiceMetadata, labels: tuple[str, ...] | list[str]) -> None:
         self._ensure_labels(service.issue_repo, labels)
-        if not service.unknown and service.autofix and service.source_repo:
+        if self._autofix_eligible(service):
             self._ensure_autofix_labels([service.issue_repo])
 
     def _notify_issue_created(
@@ -502,7 +615,7 @@ class SREService:
             return
 
         approval_action = None
-        if self.config.phone_approvals_enabled and self._autofix_pending_labels(service):
+        if self.config.phone_approvals_enabled and self._autofix_eligible(service):
             token = self.state.create_phone_approval_token(
                 fingerprint=state_key,
                 service_name=service.name,
@@ -614,6 +727,10 @@ def issue_comment(rollup: CommentRollup) -> str:
             f"- Latest local diagnostic bundle: `{rollup.bundle_reference}`",
         ]
     )
+
+
+def agent_comment(body: str) -> str:
+    return f"{AGENT_COMMENT_HEADER}\n\n{body}"
 
 
 def analyze_incident(incident: Incident, raw_logs: str) -> IssueAnalysis:

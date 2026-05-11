@@ -91,12 +91,11 @@ the SRE agent.
 
 ## Codex Autofix
 
-Autofix is disabled by default. For a service with `sre.autofix: true`, new
-issues are labeled `sre:autofix-pending`. The SRE agent polls GitHub for
-`sre:autofix-approved` on open `homelab-sre` issues. When it finds approval, it
-checks local incident state, cooldowns, daily limits, and open SRE PRs before
-sending a `repository_dispatch` event named `homelab-sre-investigate` to the
-source repo.
+Autofix is disabled by default. For a service with `sre.autofix: true`, the SRE
+agent polls GitHub for `sre:autofix-approved` on open `homelab-sre` issues.
+When it finds approval, it checks local incident state, cooldowns, daily limits,
+and open SRE PRs before sending a `repository_dispatch` event named
+`homelab-sre-investigate` to the source repo.
 
 This keeps GitHub from needing network access to the NAS. Approval happens in
 GitHub, but the NAS-hosted SRE agent polls GitHub outbound and remains the
@@ -104,14 +103,13 @@ gatekeeper.
 
 Useful labels:
 
-- `sre:autofix-pending`: code fix is available but waiting for approval.
 - `sre:autofix-approved`: approve one Codex dispatch.
-- `sre:autofix-started`: SRE agent accepted approval and dispatched Codex, or
-  found an existing SRE PR/dispatch.
-- `sre:autofix-blocked`: SRE agent could not dispatch because a safety gate
-  failed.
 - `sre:human-investigating`: leave approval in place but do not dispatch while
   a person is working.
+
+Status is reported in issue comments with a `homelab-sre-agent` prefix instead
+of state labels. If a dispatch is blocked, the comment should say which safety
+gate blocked it and what to do next.
 
 ## Phone Notifications
 
