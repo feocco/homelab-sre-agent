@@ -50,8 +50,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.sre-github-token }}
         run: |
-          mkdir -p .codex
-          echo ".codex/" >> .git/info/exclude
+          mkdir -p .codex codex-output
+          {
+            echo ".codex/"
+            echo "codex-output/"
+          } >> .git/info/exclude
           {
             echo "# Homelab SRE Context"
             echo
@@ -71,7 +74,7 @@ jobs:
           {
             echo "## Issue"
             echo
-            echo "Closes ${{ inputs.issue_url }}."
+            echo "Related to ${{ inputs.issue_url }}."
             echo
             echo "This draft PR was opened by the homelab SRE workflow. Codex did not replace the fallback PR body."
             echo
@@ -79,7 +82,11 @@ jobs:
             echo
             echo "- Not documented by Codex."
             echo
-            echo "## Fix"
+            echo "## Evidence"
+            echo
+            echo "- Not documented by Codex."
+            echo
+            echo "## Fix Logic"
             echo
             echo "- Not documented by Codex."
             echo
@@ -90,7 +97,7 @@ jobs:
             echo "## Risk"
             echo
             echo "- Review the diff carefully before merge."
-          } > .codex/sre-pr-body.md
+          } > codex-output/sre-pr-body.md
 
       - name: Run Codex
         id: run_codex
@@ -102,6 +109,7 @@ jobs:
           safety-strategy: drop-sudo
           sandbox: workspace-write
           allow-bot-users: homelab-sre
+          output-file: codex-output/codex-final-message.md
           prompt: |
             Investigate homelab SRE issue #${{ inputs.issue_number }}.
 
@@ -119,24 +127,67 @@ jobs:
             - Start from the SRE context and use targeted code search.
             - Do not scan the whole repo unless the evidence requires it.
             - Inspect the relevant code and tests.
-            - Make the smallest plausible fix.
+            - Make the smallest plausible fix that directly addresses the triggering issue.
             - Add or update focused tests when possible.
             - Do not change unrelated behavior.
-            - Update `.codex/sre-pr-body.md` with a PR description specific to the issue and actual diff.
-            - In the PR description, include `## Issue`, `## Root Cause`, `## Fix`, `## Validation`, and `## Risk`.
-            - For bugs, explain the faulty logic and how the fix changes that logic.
+            - Do not make adjacent comment, documentation, or UX-only improvements unless they directly fix the triggering incident.
+            - If you cannot identify a high-confidence code or configuration fix, leave the working tree clean except ignored `codex-output/` files and report investigation findings in your final response.
+            - Update `codex-output/sre-pr-body.md` with a PR description specific to the issue and actual diff.
+            - In the PR description, include `## Issue`, `## Root Cause`, `## Evidence`, `## Fix Logic`, `## Validation`, and `## Remaining Uncertainty`.
+            - Include concise, reviewable reasoning grounded in issue context, code references, and test results. Do not include hidden chain-of-thought.
+            - For bugs, explain the faulty logic, the evidence for that conclusion, and how the fix changes the logic.
             - For features, tools, or config changes, explain why the change is needed and what behavior it adds or changes.
+            - Do not use auto-closing keywords such as "Closes", "Fixes", or "Resolves" unless validation shows the PR directly resolves the issue; otherwise use "Related to".
             - Do not leave generic "Automated draft PR" text in the PR description.
-            - Summarize root cause, fix, and verification in the final response.
+            - Summarize root cause, evidence, fix logic, validation, and remaining uncertainty in the final response.
+
+      - name: Check code changes
+        id: check_changes
+        run: |
+          if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Report investigation without code changes
+        if: ${{ steps.check_changes.outputs.has_changes == 'false' }}
+        env:
+          GH_TOKEN: ${{ secrets.sre-github-token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          {
+            echo "**homelab-sre-agent**"
+            echo
+            echo "Autofix investigation completed without code changes."
+            echo
+            echo "- Result: Codex did not identify a high-confidence code fix, so no draft PR was opened."
+            echo "- Source repo: \`${{ github.repository }}\`"
+            echo "- Issue: #${ISSUE_NUMBER}"
+            echo "- Run: ${RUN_URL}"
+            echo
+            echo "## Investigation Findings"
+            echo
+            if [ -s codex-output/codex-final-message.md ]; then
+              sed -e 's/\r$//' codex-output/codex-final-message.md
+            else
+              echo "Codex completed without a final message file."
+            fi
+          } > codex-output/no-change-comment.md
+          gh issue comment "${ISSUE_NUMBER}" \
+            --repo "${{ github.repository }}" \
+            --body-file codex-output/no-change-comment.md
 
       - name: Create draft pull request
+        if: ${{ steps.check_changes.outputs.has_changes == 'true' }}
         id: create_pr
         uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ secrets.sre-github-token }}
           branch: codex/sre-${{ inputs.issue_number }}-${{ inputs.fingerprint }}
           title: "SRE: investigate issue #${{ inputs.issue_number }}"
-          body-path: .codex/sre-pr-body.md
+          body-path: codex-output/sre-pr-body.md
           draft: true
 
       - name: Report SRE workflow failure
@@ -148,26 +199,28 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           FETCH_CONTEXT_OUTCOME: ${{ steps.fetch_context.outcome || 'not_run' }}
           RUN_CODEX_OUTCOME: ${{ steps.run_codex.outcome || 'not_run' }}
+          CHECK_CHANGES_OUTCOME: ${{ steps.check_changes.outcome || 'not_run' }}
           CREATE_PR_OUTCOME: ${{ steps.create_pr.outcome || 'not_run' }}
         run: |
-          mkdir -p .codex
-          cat > .codex/sre-workflow-failure-comment.md <<EOF
-          **homelab-sre-agent**
-
-          Autofix workflow failed.
-
-          - Result: the GitHub Actions autofix run failed before completing draft PR creation.
-          - Source repo: \`${{ github.repository }}\`
-          - Issue: #${ISSUE_NUMBER}
-          - Expected branch: \`${EXPECTED_BRANCH}\`
-          - Run: ${RUN_URL}
-          - Step outcomes:
-            - Context fetch: \`${FETCH_CONTEXT_OUTCOME}\`
-            - Codex: \`${RUN_CODEX_OUTCOME}\`
-            - Draft PR: \`${CREATE_PR_OUTCOME}\`
-
-          Review the workflow run logs, fix the workflow or repo configuration, then dispatch autofix again.
-          EOF
+          mkdir -p codex-output
+          {
+            echo "**homelab-sre-agent**"
+            echo
+            echo "Autofix workflow failed."
+            echo
+            echo "- Result: the GitHub Actions autofix run failed before completing draft PR creation."
+            echo "- Source repo: \`${{ github.repository }}\`"
+            echo "- Issue: #${ISSUE_NUMBER}"
+            echo "- Expected branch: \`${EXPECTED_BRANCH}\`"
+            echo "- Run: ${RUN_URL}"
+            echo "- Step outcomes:"
+            echo "  - Context fetch: \`${FETCH_CONTEXT_OUTCOME}\`"
+            echo "  - Codex: \`${RUN_CODEX_OUTCOME}\`"
+            echo "  - Change check: \`${CHECK_CHANGES_OUTCOME}\`"
+            echo "  - Draft PR: \`${CREATE_PR_OUTCOME}\`"
+            echo
+            echo "Review the workflow run logs, fix the workflow or repo configuration, then dispatch autofix again."
+          } > codex-output/sre-workflow-failure-comment.md
           gh issue comment "${ISSUE_NUMBER}" \
             --repo "${{ github.repository }}" \
-            --body-file .codex/sre-workflow-failure-comment.md
+            --body-file codex-output/sre-workflow-failure-comment.md
