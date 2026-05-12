@@ -571,7 +571,12 @@ class SREService:
         elif reason == "service metadata missing":
             lines.append("- What happened: the issue maps to a service that is no longer present in SRE metadata.")
         elif reason == "dispatch error":
-            lines.append("- What happened: the agent attempted to dispatch the GitHub workflow and the call failed.")
+            lines.extend(
+                [
+                    "- What happened: the agent attempted to dispatch the GitHub workflow and the call failed.",
+                    "- Retry: resolve the GitHub API failure and apply `sre:autofix-approved` again.",
+                ]
+            )
         else:
             lines.append("- What happened: a safety gate prevented the Codex workflow from starting.")
 

@@ -133,6 +133,11 @@ class SlowFakeGitHub(FakeGitHub):
         return super().create_issue(repo=repo, title=title, body=body, labels=labels)
 
 
+class DispatchErrorFakeGitHub(FakeGitHub):
+    def repository_dispatch(self, *, repo: str, event_type: str, client_payload: dict) -> None:
+        raise RuntimeError("urlopen error [Errno -3] Try again")
+
+
 class FakeNotifier:
     def __init__(self) -> None:
         self.calls = []
@@ -820,6 +825,40 @@ services:
         self.assertIn("global Codex dispatch cap", github.dry_run_actions[-1]["body"])
         self.assertIn("SRE_CODEX_GLOBAL_DAILY_LIMIT", github.dry_run_actions[-1]["body"])
         self.assertIn("**homelab-sre-agent**", github.dry_run_actions[-1]["body"])
+
+    def test_approved_autofix_dispatch_error_comments_with_retry_guidance(self) -> None:
+        github = DispatchErrorFakeGitHub()
+        tmp, service, github = self.make_service(
+            """
+services:
+  plant-monitor:
+    containers: [plant-monitor]
+    source:
+      repo: feocco/plant-monitor
+    sre:
+      enabled: true
+      autofix: true
+      repo_daily_limit: 5
+""",
+            episode_window_seconds=0,
+            investigation_cooldown_seconds=0,
+            github=github,
+        )
+        self.addCleanup(tmp.cleanup)
+
+        result = service.handle_incident(payload(fingerprint="fingerprint-one"))
+        issue_key = ("feocco/plant-monitor", result["issue"]["number"])
+        github.add_issue_labels(repo=issue_key[0], issue_number=issue_key[1], labels=[AUTOFIX_APPROVED_LABEL])
+
+        poll_result = service.poll_autofix_approvals()
+
+        self.assertEqual(poll_result["results"][0]["status"], "blocked")
+        self.assertEqual(poll_result["results"][0]["reason"], "dispatch error")
+        self.assertNotIn(AUTOFIX_BLOCKED_LABEL, github.issues[issue_key].labels)
+        self.assertNotIn(AUTOFIX_APPROVED_LABEL, github.issues[issue_key].labels)
+        self.assertIn("attempted to dispatch the GitHub workflow", github.dry_run_actions[-1]["body"])
+        self.assertIn("urlopen error [Errno -3] Try again", github.dry_run_actions[-1]["body"])
+        self.assertIn("Retry: resolve the GitHub API failure", github.dry_run_actions[-1]["body"])
 
     def test_issue_body_uses_summary_and_local_diagnostic_reference(self) -> None:
         tmp, service, github = self.make_service(
