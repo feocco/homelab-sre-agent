@@ -46,6 +46,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Fetch SRE issue context
+        id: fetch_context
         env:
           GH_TOKEN: ${{ secrets.sre-github-token }}
         run: |
@@ -92,6 +93,7 @@ jobs:
           } > .codex/sre-pr-body.md
 
       - name: Run Codex
+        id: run_codex
         uses: openai/codex-action@v1
         with:
           openai-api-key: ${{ secrets.openai-api-key }}
@@ -99,6 +101,7 @@ jobs:
           effort: medium
           safety-strategy: drop-sudo
           sandbox: workspace-write
+          allow-bot-users: homelab-sre
           prompt: |
             Investigate homelab SRE issue #${{ inputs.issue_number }}.
 
@@ -127,6 +130,7 @@ jobs:
             - Summarize root cause, fix, and verification in the final response.
 
       - name: Create draft pull request
+        id: create_pr
         uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ secrets.sre-github-token }}
@@ -134,3 +138,36 @@ jobs:
           title: "SRE: investigate issue #${{ inputs.issue_number }}"
           body-path: .codex/sre-pr-body.md
           draft: true
+
+      - name: Report SRE workflow failure
+        if: ${{ failure() }}
+        env:
+          GH_TOKEN: ${{ secrets.sre-github-token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          EXPECTED_BRANCH: codex/sre-${{ inputs.issue_number }}-${{ inputs.fingerprint }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          FETCH_CONTEXT_OUTCOME: ${{ steps.fetch_context.outcome || 'not_run' }}
+          RUN_CODEX_OUTCOME: ${{ steps.run_codex.outcome || 'not_run' }}
+          CREATE_PR_OUTCOME: ${{ steps.create_pr.outcome || 'not_run' }}
+        run: |
+          mkdir -p .codex
+          cat > .codex/sre-workflow-failure-comment.md <<EOF
+          **homelab-sre-agent**
+
+          Autofix workflow failed.
+
+          - Result: the GitHub Actions autofix run failed before completing draft PR creation.
+          - Source repo: \`${{ github.repository }}\`
+          - Issue: #${ISSUE_NUMBER}
+          - Expected branch: \`${EXPECTED_BRANCH}\`
+          - Run: ${RUN_URL}
+          - Step outcomes:
+            - Context fetch: \`${FETCH_CONTEXT_OUTCOME}\`
+            - Codex: \`${RUN_CODEX_OUTCOME}\`
+            - Draft PR: \`${CREATE_PR_OUTCOME}\`
+
+          Review the workflow run logs, fix the workflow or repo configuration, then dispatch autofix again.
+          EOF
+          gh issue comment "${ISSUE_NUMBER}" \
+            --repo "${{ github.repository }}" \
+            --body-file .codex/sre-workflow-failure-comment.md
