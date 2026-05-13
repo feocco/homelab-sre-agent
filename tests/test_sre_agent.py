@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
+import sys
 import threading
 import tempfile
 import time
+from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import patch
 
@@ -18,6 +21,7 @@ from homelab_sre_agent.notifications import (
     PHONE_APPROVAL_TOKEN_TTL_SECONDS,
     SRE_APPROVE_ACTION_PREFIX,
     IssueNotifier,
+    PhoneApprovalListener,
 )
 from homelab_sre_agent.redact import redact_text
 from homelab_sre_agent.service import (
@@ -302,6 +306,53 @@ class GitHubAppAuthTests(TestCase):
         self.assertEqual(second, "token-1")
         self.assertEqual(third, "token-2")
         self.assertEqual(auth.requests, ["jwt-1779000000", "jwt-1779003400"])
+
+
+class FakeNotificationActionRouter:
+    def register(self, prefix, callback) -> None:
+        self.prefix = prefix
+        self.callback = callback
+
+    def handle_event(self, event: dict) -> bool:
+        return False
+
+
+class FakeHomeAssistantWebSocketClient:
+    @classmethod
+    def from_env(cls):
+        return cls()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        return None
+
+    def add_event_handler(self, handler) -> None:
+        self.handler = handler
+
+    async def subscribe_events(self, event_type: str) -> None:
+        self.event_type = event_type
+
+    async def wait_closed(self) -> None:
+        return None
+
+
+class NotificationTests(TestCase):
+    def test_phone_listener_warns_when_home_assistant_websocket_closes(self) -> None:
+        fake_homelab = SimpleNamespace(
+            NotificationActionRouter=FakeNotificationActionRouter,
+            HomeAssistantWebSocketClient=FakeHomeAssistantWebSocketClient,
+        )
+        listener = PhoneApprovalListener(service=object())
+
+        with (
+            patch.dict(sys.modules, {"homelab": fake_homelab}),
+            self.assertLogs("homelab-sre-agent.notifications", level="WARNING") as logs,
+        ):
+            asyncio.run(listener._run_connected())
+
+        self.assertIn("Phone approval listener disconnected; reconnecting", "\n".join(logs.output))
 
 
 class ServiceTests(TestCase):

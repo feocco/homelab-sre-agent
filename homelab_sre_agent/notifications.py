@@ -99,6 +99,7 @@ class PhoneApprovalListener:
             await ha.subscribe_events("mobile_app_notification_action")
             LOGGER.info("Listening for SRE phone approval actions")
             await ha.wait_closed()
+            LOGGER.warning("Phone approval listener disconnected; reconnecting")
 
     def _handle_approval(self, token: str, event: dict[str, Any]) -> None:
         result = self.service.approve_autofix_from_phone(token)
