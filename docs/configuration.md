@@ -10,6 +10,25 @@ Runtime configuration for the deployed service belongs in the private
 
 The public app repo should keep only examples and the code contract.
 
+## Defaults
+
+- Runs on `SERVICE_PORT=8094`.
+- Stores state in SQLite at `SRE_STATE_PATH`.
+- Stores full local diagnostic bundles under `SRE_DIAGNOSTIC_DIR`; GitHub
+  issues include only a redacted representative line and local bundle reference.
+- Reads private service metadata from `SRE_SERVICE_METADATA_PATH` on every
+  incident.
+- Ignores containers that do not match an explicitly enabled metadata service.
+- Starts in `SRE_DRY_RUN=true`, recording intended GitHub actions without
+  writing to GitHub.
+- Creates one issue per incident family/episode so traceback bursts and repeat
+  observations update the same issue.
+- Bundles repeated episode updates into at most one GitHub comment per
+  `SRE_ISSUE_COMMENT_COOLDOWN_SECONDS`.
+- Keeps Codex dispatch disabled unless service metadata sets `sre.autofix:
+  true` and an issue receives the `sre:autofix-approved` label.
+- Polls GitHub for approved SRE issues every `SRE_APPROVAL_POLL_SECONDS`.
+
 ## Core Runtime Variables
 
 ```text
