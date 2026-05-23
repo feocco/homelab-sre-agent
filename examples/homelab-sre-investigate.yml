@@ -10,7 +10,9 @@ jobs:
       contents: write
       pull-requests: write
       issues: read
-    uses: feocco/homelab-sre-agent/.github/workflows/homelab-sre-codex.yml@main
+    # Replace this placeholder with a release tag or commit SHA that includes
+    # the diagnostic_url input. Do not use @main for production callers.
+    uses: feocco/homelab-sre-agent/.github/workflows/homelab-sre-codex.yml@<pinned-release-or-commit-sha>
     with:
       issue_number: ${{ github.event.client_payload.issue_number }}
       issue_url: ${{ github.event.client_payload.issue_url }}
@@ -20,6 +22,7 @@ jobs:
       state_fingerprint: ${{ github.event.client_payload.state_fingerprint }}
       deployment_repo: ${{ github.event.client_payload.deployment_repo }}
       deployment_path: ${{ github.event.client_payload.deployment_path }}
+      diagnostic_url: ${{ github.event.client_payload.diagnostic_url || '' }}
     secrets:
       openai-api-key: ${{ secrets.OPENAI_API_KEY }}
       sre-github-token: ${{ secrets.SRE_GITHUB_TOKEN }}

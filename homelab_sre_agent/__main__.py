@@ -7,6 +7,7 @@ import threading
 import time
 
 from .config import Config
+from .diagnostics import S3DiagnosticPublisher
 from .docker_logs import DockerLogCollector
 from .github import github_client_from_config
 from .metadata import load_catalog
@@ -31,11 +32,25 @@ def main() -> int:
         github=github,
         logs=DockerLogCollector(),
         issue_notifier=IssueNotifier() if config.issue_notifications_enabled else None,
+        diagnostic_publisher=diagnostic_publisher_from_config(config),
     )
     start_approval_poller(config, service)
     start_phone_approval_listener(config, service)
     SREServer(config=config, service=service).serve_forever()
     return 0
+
+
+def diagnostic_publisher_from_config(config: Config) -> S3DiagnosticPublisher | None:
+    if not config.diagnostic_publish_enabled:
+        return None
+    if not config.diagnostic_s3_bucket:
+        raise ValueError("SRE_DIAGNOSTIC_S3_BUCKET is required when SRE_DIAGNOSTIC_PUBLISH_ENABLED=true")
+    return S3DiagnosticPublisher(
+        bucket=config.diagnostic_s3_bucket,
+        prefix=config.diagnostic_s3_prefix,
+        url_ttl_seconds=config.diagnostic_url_ttl_seconds,
+        region_name=config.diagnostic_s3_region,
+    )
 
 
 def start_approval_poller(config: Config, service: SREService) -> None:

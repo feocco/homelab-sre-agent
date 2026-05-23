@@ -44,6 +44,7 @@ class IncidentRecord:
     pending_comment_last_seen_at: str | None
     pending_comment_line: str | None
     pending_comment_bundle_reference: str | None
+    latest_diagnostic_reference: str | None
 
 
 @dataclass(frozen=True)
@@ -59,6 +60,18 @@ class CommentRollup:
     last_seen_at: str
     line: str
     bundle_reference: str
+
+
+@dataclass(frozen=True)
+class RecurrenceSummary:
+    total_count: int
+    first_seen_at: str | None
+    latest_seen_at: str | None
+    last_24h_count: int
+    last_7d_count: int
+    last_14d_count: int
+    average_gap_seconds: int | None
+    likelihood: str
 
 
 @dataclass(frozen=True)
@@ -122,6 +135,18 @@ class StateStore:
                   created_at TEXT NOT NULL,
                   used_at TEXT
                 );
+
+                CREATE TABLE IF NOT EXISTS incident_observations (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  fingerprint TEXT NOT NULL,
+                  service_name TEXT NOT NULL,
+                  issue_repo TEXT NOT NULL,
+                  source_fingerprint TEXT NOT NULL,
+                  severity TEXT NOT NULL,
+                  observed_at TEXT NOT NULL,
+                  representative_line TEXT NOT NULL,
+                  diagnostic_reference TEXT NOT NULL
+                );
                 """
             )
             self._ensure_column("incidents", "issue_create_claimed_at", "TEXT")
@@ -132,6 +157,7 @@ class StateStore:
             self._ensure_column("incidents", "pending_comment_last_seen_at", "TEXT")
             self._ensure_column("incidents", "pending_comment_line", "TEXT")
             self._ensure_column("incidents", "pending_comment_bundle_reference", "TEXT")
+            self._ensure_column("incidents", "latest_diagnostic_reference", "TEXT")
             self.connection.commit()
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
@@ -301,6 +327,99 @@ class StateStore:
             )
             self.connection.commit()
 
+    def record_observation(
+        self,
+        *,
+        fingerprint: str,
+        service_name: str,
+        issue_repo: str,
+        source_fingerprint: str,
+        severity: str,
+        observed_at: datetime,
+        representative_line: str,
+        diagnostic_reference: str,
+    ) -> RecurrenceSummary:
+        timestamp = format_dt(observed_at)
+        with self._lock:
+            self.connection.execute(
+                """
+                INSERT INTO incident_observations (
+                  fingerprint,
+                  service_name,
+                  issue_repo,
+                  source_fingerprint,
+                  severity,
+                  observed_at,
+                  representative_line,
+                  diagnostic_reference
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    fingerprint,
+                    service_name,
+                    issue_repo,
+                    source_fingerprint,
+                    severity,
+                    timestamp,
+                    representative_line,
+                    diagnostic_reference,
+                ),
+            )
+            self.connection.execute(
+                "UPDATE incidents SET latest_diagnostic_reference = ? WHERE fingerprint = ?",
+                (diagnostic_reference, fingerprint),
+            )
+            self.connection.commit()
+            return self.recurrence_summary(fingerprint=fingerprint, now=observed_at)
+
+    def recurrence_summary(self, *, fingerprint: str, now: datetime) -> RecurrenceSummary:
+        with self._lock:
+            rows = self.connection.execute(
+                """
+                SELECT observed_at FROM incident_observations
+                WHERE fingerprint = ?
+                ORDER BY observed_at ASC
+                """,
+                (fingerprint,),
+            ).fetchall()
+        observed = [value for value in (parse_dt(str(row["observed_at"])) for row in rows) if value is not None]
+        if not observed:
+            return RecurrenceSummary(
+                total_count=0,
+                first_seen_at=None,
+                latest_seen_at=None,
+                last_24h_count=0,
+                last_7d_count=0,
+                last_14d_count=0,
+                average_gap_seconds=None,
+                likelihood="unknown",
+            )
+        gaps = [
+            int((right - left).total_seconds())
+            for left, right in zip(observed, observed[1:])
+            if right >= left
+        ]
+        last_24h = now - timedelta(hours=24)
+        last_7d = now - timedelta(days=7)
+        last_14d = now - timedelta(days=14)
+        last_14d_count = sum(1 for item in observed if item >= last_14d)
+        if last_14d_count >= 3:
+            likelihood = "likely"
+        elif last_14d_count == 2:
+            likelihood = "possible"
+        else:
+            likelihood = "unlikely"
+        return RecurrenceSummary(
+            total_count=len(observed),
+            first_seen_at=format_dt(observed[0]),
+            latest_seen_at=format_dt(observed[-1]),
+            last_24h_count=sum(1 for item in observed if item >= last_24h),
+            last_7d_count=sum(1 for item in observed if item >= last_7d),
+            last_14d_count=last_14d_count,
+            average_gap_seconds=int(sum(gaps) / len(gaps)) if gaps else None,
+            likelihood=likelihood,
+        )
+
     def record_pending_comment(
         self,
         *,
@@ -461,6 +580,7 @@ def incident_from_row(row: sqlite3.Row | None) -> IncidentRecord | None:
         pending_comment_bundle_reference=str(row["pending_comment_bundle_reference"])
         if row["pending_comment_bundle_reference"]
         else None,
+        latest_diagnostic_reference=str(row["latest_diagnostic_reference"]) if row["latest_diagnostic_reference"] else None,
     )
 
 

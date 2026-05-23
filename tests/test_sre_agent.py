@@ -30,6 +30,7 @@ from homelab_sre_agent.service import (
     Incident,
     SREService,
     issue_title,
+    normalize_for_key,
 )
 from homelab_sre_agent.state import StateStore
 
@@ -142,6 +143,15 @@ class FakeNotifier:
         return {"status": "sent"}
 
 
+class FakeDiagnosticPublisher:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def publish(self, *, service, issue, state_key, diagnostic_reference, recurrence, now):
+        self.calls.append((service.name, issue.number, state_key, diagnostic_reference, recurrence.total_count))
+        return f"https://diagnostics.example/{issue.number}?signature=short-lived"
+
+
 def make_config(
     path: Path,
     *,
@@ -177,6 +187,11 @@ def make_config(
         approval_poll_seconds=300,
         issue_notifications_enabled=issue_notifications_enabled,
         phone_approvals_enabled=phone_approvals_enabled,
+        diagnostic_publish_enabled=False,
+        diagnostic_s3_bucket=None,
+        diagnostic_s3_region=None,
+        diagnostic_s3_prefix="diagnostics",
+        diagnostic_url_ttl_seconds=3600,
         service_host="127.0.0.1",
         service_port=8094,
         http_timeout_seconds=10,
@@ -319,6 +334,7 @@ class ServiceTests(TestCase):
         phone_approvals_enabled: bool = False,
         codex_global_daily_limit: int = 3,
         now_func=None,
+        diagnostic_publisher=None,
     ):
         tmp = tempfile.TemporaryDirectory()
         path = Path(tmp.name)
@@ -342,6 +358,7 @@ class ServiceTests(TestCase):
             logs=FakeLogs(logs),
             issue_notifier=issue_notifier,
             now_func=now_func,
+            diagnostic_publisher=diagnostic_publisher,
         )
         return tmp, service, github
 
@@ -444,6 +461,29 @@ services:
         self.assertEqual([action["action"] for action in github.dry_run_actions], ["create_issue", "comment_issue"])
         self.assertIn("Observed 3 more times since the last update.", github.dry_run_actions[-1]["body"])
         self.assertIn("**homelab-sre-agent**", github.dry_run_actions[-1]["body"])
+
+    def test_issue_body_includes_recurrence_history(self) -> None:
+        clock = FakeClock()
+        tmp, service, github = self.make_service(
+            """
+services:
+  plant-monitor:
+    containers: [plant-monitor]
+    source:
+      repo: feocco/plant-monitor
+    sre:
+      enabled: true
+""",
+            now_func=clock.now,
+        )
+        self.addCleanup(tmp.cleanup)
+
+        service.handle_incident(payload(fingerprint="fingerprint-one"))
+
+        body = github.dry_run_actions[0]["body"]
+        self.assertIn("## Recurrence", body)
+        self.assertIn("Total observations: `1`", body)
+        self.assertIn("Likelihood next 14 days: `unlikely`", body)
 
     def test_concurrent_same_issue_key_creates_one_issue(self) -> None:
         github = SlowFakeGitHub()
@@ -555,6 +595,40 @@ services:
         self.assertNotIn(AUTOFIX_PENDING_LABEL, github.issues[issue_key].labels)
         self.assertIn("sent `repository_dispatch`", github.dry_run_actions[-1]["body"])
         self.assertIn("**homelab-sre-agent**", github.dry_run_actions[-1]["body"])
+
+    def test_autofix_dispatch_includes_published_diagnostic_url(self) -> None:
+        github = FakeGitHub()
+        publisher = FakeDiagnosticPublisher()
+        tmp, service, github = self.make_service(
+            """
+services:
+  plant-monitor:
+    containers: [plant-monitor]
+    source:
+      repo: feocco/plant-monitor
+    sre:
+      enabled: true
+      autofix: true
+      repo_daily_limit: 1
+""",
+            episode_window_seconds=0,
+            investigation_cooldown_seconds=0,
+            github=github,
+            diagnostic_publisher=publisher,
+        )
+        self.addCleanup(tmp.cleanup)
+
+        result = service.handle_incident(payload(fingerprint="fingerprint-one"))
+        issue_key = ("feocco/plant-monitor", result["issue"]["number"])
+        github.add_issue_labels(repo=issue_key[0], issue_number=issue_key[1], labels=[AUTOFIX_APPROVED_LABEL])
+        service.poll_autofix_approvals()
+
+        dispatch_actions = [action for action in github.dry_run_actions if action["action"] == "repository_dispatch"]
+        self.assertEqual(len(dispatch_actions), 1)
+        client_payload = dispatch_actions[0]["client_payload"]
+        self.assertEqual(client_payload["diagnostic_url"], "https://diagnostics.example/2?signature=short-lived")
+        self.assertEqual(client_payload["diagnostic_reference"].startswith("/nas/diagnostics/plant-monitor/"), True)
+        self.assertEqual(publisher.calls[0][4], 1)
 
     def test_new_issue_sends_phone_notification_with_approval_button(self) -> None:
         github = FakeGitHub()
@@ -879,3 +953,16 @@ services:
         body = github.dry_run_actions[0]["body"]
         self.assertIn("hit `NameError`", body)
         self.assertIn("name 'CANARY_STATUS' is not defined", body)
+
+    def test_normalize_for_key_removes_volatile_network_details(self) -> None:
+        first = normalize_for_key(
+            "2026-05-12T09:55:10.364975952-04:00 aiohttp.client_exceptions.ClientConnectorError: "
+            "Cannot connect to host abc123.ui.nabu.casa:443 ssl:default [None]"
+        )
+        second = normalize_for_key(
+            "2026-05-22T02:53:26.526774579-04:00 aiohttp.client_exceptions.ClientConnectorError: "
+            "Cannot connect to host xyz789.ui.nabu.casa:443 ssl:default [None]"
+        )
+
+        self.assertEqual(first, second)
+        self.assertIn("<host>", first)

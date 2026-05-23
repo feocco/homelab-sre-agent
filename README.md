@@ -8,6 +8,10 @@ Docker log context and deployment metadata, then creates or updates a GitHub
 issue and can send the phone notification for that issue. Codex-based autofix is
 opt-in per service and is triggered with a GitHub `repository_dispatch` event.
 
+This split is intentional: `homelab-log-watcher` detects log events, while
+`homelab-sre-agent` handles dedupe, recurrence history, issue lifecycle,
+notifications, diagnostic handoff, and Codex dispatch safety gates.
+
 ## Defaults
 
 - Runs on `SERVICE_PORT=8094`.
@@ -48,6 +52,11 @@ SRE_CODEX_GLOBAL_DAILY_LIMIT=3
 SRE_APPROVAL_POLL_SECONDS=300
 SRE_ISSUE_NOTIFICATIONS_ENABLED=false
 SRE_PHONE_APPROVALS_ENABLED=false
+SRE_DIAGNOSTIC_PUBLISH_ENABLED=false
+SRE_DIAGNOSTIC_S3_BUCKET=
+SRE_DIAGNOSTIC_S3_REGION=
+SRE_DIAGNOSTIC_S3_PREFIX=diagnostics
+SRE_DIAGNOSTIC_URL_TTL_SECONDS=3600
 SRE_HTTP_TIMEOUT_SECONDS=10
 GITHUB_AUTH_MODE=token
 GITHUB_TOKEN=replace_me
@@ -75,6 +84,27 @@ For public issue repos, keep full logs local. Set
 `SRE_DIAGNOSTIC_REFERENCE_ROOT` to the NAS host path for the mounted state
 directory, for example
 `/volume1/docker/homelab-config/homelab-sre-agent/data/diagnostics`.
+
+## Diagnostic Handoff
+
+The NAS should not be exposed publicly for cloud Codex diagnostics. When
+`SRE_DIAGNOSTIC_PUBLISH_ENABLED=true`, the SRE agent publishes a redacted,
+bounded diagnostic summary to a private S3 bucket over outbound HTTPS, generates
+a short-lived pre-signed URL, and includes that URL in the Codex dispatch
+payload.
+
+Recommended bucket posture:
+
+- Block all public access.
+- Enable default encryption.
+- Add a lifecycle rule that expires diagnostic objects after 7-14 days.
+- Give the NAS-side SRE agent an IAM key limited to the diagnostic prefix.
+- Do not give GitHub Actions broad AWS credentials for v1.
+
+The published diagnostic payload is not the raw full log bundle. It contains
+issue metadata, deployment metadata, recurrence counts, and the local diagnostic
+reference. If publishing fails, Codex still runs with GitHub issue context and
+must state that diagnostic context was unavailable.
 
 ## Incident API
 
@@ -118,6 +148,13 @@ Status is reported in issue comments with a `homelab-sre-agent` prefix instead
 of state labels. If a dispatch is blocked, the comment should say which safety
 gate blocked it and what to do next.
 
+The SRE issue body and Codex prompt intentionally mirror the local Codex agent
+principles: state behavior-affecting assumptions, make the smallest targeted
+change, avoid speculative features, keep diffs surgical, verify outcomes, and
+explain tradeoffs. Suppressing or downgrading an error must explain why that is
+better than a fix; for connection errors, the explanation must identify the
+retry/backoff path and why WARN or INFO is the right severity.
+
 ## Phone Notifications
 
 Set `SRE_ISSUE_NOTIFICATIONS_ENABLED=true` to send a phone notification when a
@@ -135,11 +172,35 @@ The target repo should include a small dispatch wrapper like
 a token that can create draft PRs. The wrapper calls the reusable workflow in
 this repo at `.github/workflows/homelab-sre-codex.yml`.
 
-The reusable workflow owns the Codex prompt, model, PR body policy, and draft PR
-creation. It writes the PR body to `.codex/sre-pr-body.md`, then passes that
-file to `peter-evans/create-pull-request` with `body-path`. The PR body should
-explain the triggering issue, root cause or reason for the change, fix details,
-validation, and remaining risk. Human review remains the deployment gate.
+Pin production callers to a release tag or commit SHA of this repo's reusable
+workflow. Do not use `@main` in production callers; update the pinned reference
+intentionally after reviewing workflow changes.
+
+The reusable workflow owns the Codex prompt, model, PR body policy, diagnostic
+context fetch, and draft PR creation. It writes the PR body to
+`codex-output/sre-pr-body.md`, then passes that file to
+`peter-evans/create-pull-request` with `body-path`. The PR body should explain
+the triggering issue, root cause or reason for the change, evidence, fix
+details, validation, and remaining uncertainty. Human review remains the
+deployment gate.
+
+The workflow pins external Actions by commit SHA so the PR path is static and
+auditable. To update an Action, intentionally change the SHA in this repo and
+review the diff before rolling the reusable workflow reference forward in
+caller repos.
+
+## After Implementation
+
+To enable cloud diagnostics without exposing the NAS:
+
+1. Create a private S3 bucket for SRE diagnostic handoff.
+2. Block public access, enable encryption, and add lifecycle expiration.
+3. Create a least-privilege IAM key for the NAS-side SRE agent.
+4. Add the S3 settings and AWS credentials through `homelab-config`.
+5. Deploy `homelab-sre-agent`.
+6. Update caller repos to a pinned reusable workflow release or commit.
+7. Trigger one approved SRE test incident and confirm the workflow fetches the
+   redacted diagnostic context.
 
 ## Run Locally
 

@@ -6,7 +6,7 @@ import hashlib
 import logging
 import re
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 
 from .config import Config
 from .docker_logs import DockerLogCollector
@@ -14,7 +14,7 @@ from .github import GitHubClient, GitHubIssue, IssueResult
 from .metadata import ServiceCatalog, ServiceMetadata
 from .notifications import IssueNotifier, PHONE_APPROVAL_TOKEN_TTL_SECONDS, make_approval_action
 from .redact import redact_text
-from .state import CommentRollup, StateStore, utc_now
+from .state import CommentRollup, RecurrenceSummary, StateStore, utc_now
 
 
 LOGGER = logging.getLogger("homelab-sre-agent")
@@ -33,6 +33,19 @@ AUTOFIX_LABELS = {
     AUTOFIX_APPROVED_LABEL: ("bbf7d0", "Approval for the homelab SRE agent to dispatch Codex."),
     HUMAN_INVESTIGATING_LABEL: ("ddd6fe", "A human is investigating; SRE autofix should not start."),
 }
+
+
+class DiagnosticPublisher(Protocol):
+    def publish(
+        self,
+        *,
+        service: ServiceMetadata,
+        issue: IssueResult,
+        state_key: str,
+        diagnostic_reference: str,
+        recurrence: RecurrenceSummary,
+        now: datetime,
+    ) -> str: ...
 
 
 @dataclass(frozen=True)
@@ -99,6 +112,7 @@ class SREService:
         logs: DockerLogCollector,
         issue_notifier: IssueNotifier | None = None,
         now_func: Callable[[], datetime] | None = None,
+        diagnostic_publisher: DiagnosticPublisher | None = None,
     ) -> None:
         self.config = config
         if catalog is None and catalog_loader is None:
@@ -110,6 +124,7 @@ class SREService:
         self.logs = logs
         self.issue_notifier = issue_notifier
         self.now_func = now_func or utc_now
+        self.diagnostic_publisher = diagnostic_publisher
 
     def handle_incident(self, payload: dict[str, Any]) -> dict[str, Any]:
         now = self.now_func()
@@ -131,6 +146,16 @@ class SREService:
             now=now,
             claim_ttl_seconds=ISSUE_CREATE_CLAIM_TTL_SECONDS,
         )
+        recurrence = self.state.record_observation(
+            fingerprint=state_key,
+            service_name=service.name,
+            issue_repo=service.issue_repo,
+            source_fingerprint=incident.fingerprint,
+            severity=incident.severity,
+            observed_at=now,
+            representative_line=sanitized_line,
+            diagnostic_reference=bundle.reference,
+        )
 
         title = issue_title(service, incident, state_key)
         labels = sorted(set(service.labels + (SRE_LABEL, incident.severity.lower())))
@@ -143,7 +168,16 @@ class SREService:
                     issue = self.github.create_issue(
                         repo=service.issue_repo,
                         title=title,
-                        body=issue_body(service, incident, analysis, sanitized_line, bundle, self.config.dry_run, state_key),
+                        body=issue_body(
+                            service,
+                            incident,
+                            analysis,
+                            sanitized_line,
+                            bundle,
+                            self.config.dry_run,
+                            state_key,
+                            recurrence,
+                        ),
                         labels=labels,
                     )
                 except Exception:
@@ -183,7 +217,7 @@ class SREService:
                 self.github.comment_issue(
                     repo=service.issue_repo,
                     issue_number=claim.record.issue_number,
-                    body=agent_comment(issue_comment(rollup)),
+                    body=agent_comment(issue_comment(rollup, recurrence)),
                 )
                 self.state.mark_comment_sent(fingerprint=state_key, now=now)
             issue_action = "updated"
@@ -335,6 +369,23 @@ class SREService:
             "deployment_repo": service.deploy_repo,
             "deployment_path": service.deploy_path,
         }
+        record = self.state.get_incident(state_key)
+        if self.diagnostic_publisher is not None and record is not None:
+            recurrence = self.state.recurrence_summary(fingerprint=state_key, now=now)
+            reference = record.latest_diagnostic_reference or ""
+            if reference:
+                try:
+                    payload["diagnostic_url"] = self.diagnostic_publisher.publish(
+                        service=service,
+                        issue=issue,
+                        state_key=state_key,
+                        diagnostic_reference=reference,
+                        recurrence=recurrence,
+                        now=now,
+                    )
+                    payload["diagnostic_reference"] = reference
+                except Exception:
+                    LOGGER.exception("Could not publish diagnostic context for %s", state_key)
         self.github.repository_dispatch(
             repo=service.source_repo,
             event_type="homelab-sre-investigate",
@@ -670,6 +721,7 @@ def issue_body(
     bundle: DiagnosticBundle,
     dry_run: bool,
     state_key: str,
+    recurrence: RecurrenceSummary,
 ) -> str:
     return "\n".join(
         [
@@ -696,6 +748,10 @@ def issue_body(
             f"- Image: `{incident.image}`",
             f"- Matched pattern: `{incident.matched_pattern}`",
             "",
+            "## Recurrence",
+            "",
+            recurrence_summary_lines(recurrence),
+            "",
             "## Deployment Metadata",
             "",
             f"- Service: `{service.name}`",
@@ -712,11 +768,13 @@ def issue_body(
             "",
             "Start from this incident summary and use targeted code search. Do not scan the whole repo unless the evidence requires it.",
             "Keep fixes narrowly scoped to the failure. Prefer a small PR with tests or a clear validation note.",
+            "State assumptions when they affect behavior, avoid speculative changes, and explain tradeoffs when choosing suppression over a fix.",
+            "If downgrading or suppressing a connection error, identify the retry/backoff path and why the event is transient enough for WARN/INFO.",
         ]
     )
 
 
-def issue_comment(rollup: CommentRollup) -> str:
+def issue_comment(rollup: CommentRollup, recurrence: RecurrenceSummary) -> str:
     return "\n".join(
         [
             f"Observed {rollup.count} more times since the last update.",
@@ -725,6 +783,7 @@ def issue_comment(rollup: CommentRollup) -> str:
             f"- Latest repeated observation: `{rollup.last_seen_at}`",
             f"- Latest redacted log line: `{rollup.line}`",
             f"- Latest local diagnostic bundle: `{rollup.bundle_reference}`",
+            f"- Likelihood next 14 days: `{recurrence.likelihood}`",
         ]
     )
 
@@ -772,7 +831,27 @@ def strip_log_timestamp(line: str) -> str:
 
 
 def normalize_for_key(value: str) -> str:
-    return re.sub(r"\s+", " ", strip_log_timestamp(value)).strip().lower()
+    normalized = strip_log_timestamp(value).lower()
+    normalized = re.sub(r"https?://\S+", "<url>", normalized)
+    normalized = re.sub(r"\b[a-z0-9.-]+\.(ui\.nabu\.casa|local|lan|internal)\b", "<host>", normalized)
+    normalized = re.sub(r"\b[0-9a-f]{12,}\b", "<hex>", normalized)
+    normalized = re.sub(r"\b[a-z0-9_-]{24,}\b", "<id>", normalized)
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized.strip()
+
+
+def recurrence_summary_lines(recurrence: RecurrenceSummary) -> str:
+    average_gap = f"{recurrence.average_gap_seconds}s" if recurrence.average_gap_seconds is not None else "n/a"
+    return "\n".join(
+        [
+            f"- Total observations: `{recurrence.total_count}`",
+            f"- First seen: `{recurrence.first_seen_at or 'unknown'}`",
+            f"- Latest seen: `{recurrence.latest_seen_at or 'unknown'}`",
+            f"- Last 24h / 7d / 14d: `{recurrence.last_24h_count}` / `{recurrence.last_7d_count}` / `{recurrence.last_14d_count}`",
+            f"- Average gap: `{average_gap}`",
+            f"- Likelihood next 14 days: `{recurrence.likelihood}`",
+        ]
+    )
 
 
 def dispatch_fingerprint(state_key: str) -> str:
