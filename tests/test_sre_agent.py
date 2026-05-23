@@ -4,6 +4,7 @@ import base64
 from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
+import re
 import threading
 import tempfile
 import time
@@ -267,6 +268,11 @@ class ConfigTests(TestCase):
 
         self.assertEqual(config.github_auth_mode, "app")
         self.assertEqual(config.github_app_private_key, "private-key")
+
+    def test_runtime_dependencies_include_diagnostic_publisher_dependencies(self) -> None:
+        requirements = Path("requirements.txt").read_text(encoding="utf-8")
+
+        self.assertRegex(requirements, re.compile(r"^boto3[<>=]", re.MULTILINE))
 
     def test_github_app_auth_requires_complete_config_when_not_dry_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
