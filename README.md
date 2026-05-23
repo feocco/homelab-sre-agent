@@ -34,44 +34,13 @@ notifications, diagnostic handoff, and Codex dispatch safety gates.
 
 ## Configuration
 
-```text
-SRE_STATE_PATH=/app/state/sre-agent.sqlite3
-SRE_SERVICE_METADATA_PATH=/app/config/services.yaml
-SRE_DIAGNOSTIC_DIR=/app/state/diagnostics
-SRE_DIAGNOSTIC_REFERENCE_ROOT=/app/state/diagnostics
-SRE_INCIDENT_TOKEN=replace_me
-SRE_DEFAULT_ISSUE_REPO=feocco/homelab-config
-SRE_DRY_RUN=true
-SRE_DOCKER_LOG_TAIL=200
-SRE_DOCKER_LOG_LOOKBACK_SECONDS=600
-SRE_EPISODE_WINDOW_SECONDS=120
-SRE_DIAGNOSTIC_MAX_BYTES=1000000
-SRE_INVESTIGATION_COOLDOWN_SECONDS=86400
-SRE_ISSUE_COMMENT_COOLDOWN_SECONDS=3600
-SRE_CODEX_GLOBAL_DAILY_LIMIT=3
-SRE_APPROVAL_POLL_SECONDS=300
-SRE_ISSUE_NOTIFICATIONS_ENABLED=false
-SRE_PHONE_APPROVALS_ENABLED=false
-SRE_DIAGNOSTIC_PUBLISH_ENABLED=false
-SRE_DIAGNOSTIC_S3_BUCKET=
-SRE_DIAGNOSTIC_S3_REGION=
-SRE_DIAGNOSTIC_S3_PREFIX=diagnostics
-SRE_DIAGNOSTIC_URL_TTL_SECONDS=3600
-SRE_HTTP_TIMEOUT_SECONDS=10
-GITHUB_AUTH_MODE=token
-GITHUB_TOKEN=replace_me
-GITHUB_APP_ID=replace_me
-GITHUB_APP_INSTALLATION_ID=replace_me
-GITHUB_APP_PRIVATE_KEY_B64=replace_me
-GITHUB_API_URL=https://api.github.com
-HOMELAB_FUNCTIONS_URL=http://nasfeo:8091
-HOMELAB_FUNCTIONS_TOKEN=replace_me
-HA_URL=https://homeassistant.example
-HA_LONG_LIVED_TOKEN=replace_me
-SERVICE_HOST=0.0.0.0
-SERVICE_PORT=8094
-LOG_LEVEL=INFO
-```
+Runtime configuration lives in the private `homelab-config` repo. This public
+repo documents the contract and examples only:
+
+- [`docs/configuration.md`](docs/configuration.md): environment variables and
+  `homelab-config` ownership.
+- [`docs/diagnostic-security.md`](docs/diagnostic-security.md): diagnostic S3
+  handoff, network path, and security tradeoffs.
 
 When `SRE_DRY_RUN=false`, GitHub authentication must be configured. The default
 is `GITHUB_AUTH_MODE=token`, which uses `GITHUB_TOKEN`. Prefer
@@ -87,24 +56,10 @@ directory, for example
 
 ## Diagnostic Handoff
 
-The NAS should not be exposed publicly for cloud Codex diagnostics. When
-`SRE_DIAGNOSTIC_PUBLISH_ENABLED=true`, the SRE agent publishes a redacted,
-bounded diagnostic summary to a private S3 bucket over outbound HTTPS, generates
-a short-lived pre-signed URL, and includes that URL in the Codex dispatch
-payload.
-
-Recommended bucket posture:
-
-- Block all public access.
-- Enable default encryption.
-- Add a lifecycle rule that expires diagnostic objects after 7-14 days.
-- Give the NAS-side SRE agent an IAM key limited to the diagnostic prefix.
-- Do not give GitHub Actions broad AWS credentials for v1.
-
-The published diagnostic payload is not the raw full log bundle. It contains
-issue metadata, deployment metadata, recurrence counts, and the local diagnostic
-reference. If publishing fails, Codex still runs with GitHub issue context and
-must state that diagnostic context was unavailable.
+Cloud Codex does not connect to the NAS. When an approved autofix is dispatched,
+the NAS-hosted SRE agent uploads a bounded diagnostic summary to private S3 over
+outbound HTTPS, then gives the Codex workflow a short-lived pre-signed URL for
+that one object. See [`docs/diagnostic-security.md`](docs/diagnostic-security.md).
 
 ## Incident API
 
@@ -188,19 +143,6 @@ The workflow pins external Actions by commit SHA so the PR path is static and
 auditable. To update an Action, intentionally change the SHA in this repo and
 review the diff before rolling the reusable workflow reference forward in
 caller repos.
-
-## After Implementation
-
-To enable cloud diagnostics without exposing the NAS:
-
-1. Create a private S3 bucket for SRE diagnostic handoff.
-2. Block public access, enable encryption, and add lifecycle expiration.
-3. Create a least-privilege IAM key for the NAS-side SRE agent.
-4. Add the S3 settings and AWS credentials through `homelab-config`.
-5. Deploy `homelab-sre-agent`.
-6. Update caller repos to a pinned reusable workflow release or commit.
-7. Trigger one approved SRE test incident and confirm the workflow fetches the
-   redacted diagnostic context.
 
 ## Run Locally
 
