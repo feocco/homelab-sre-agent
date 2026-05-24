@@ -25,6 +25,9 @@ flowchart LR
     workflow -- "GET diagnostic summary" --> s3
     workflow --> codex["Codex Cloud"]
     codex -- "draft PR or no-change comment" --> github
+    codex -- "routing metadata suggestion" --> github
+    github -- "approved metadata label" --> metapr["Routing metadata\nPR workflow"]
+    metapr -- "reviewed PR" --> config["homelab-config"]
 ```
 
 ## Service Boundaries
@@ -75,6 +78,8 @@ Owns the durable human review surface:
 
 - Public-safe issue body.
 - Labels such as `sre:autofix-approved` and `sre:human-investigating`.
+- Reviewed routing labels such as `sre:metadata-suggested` and
+  `sre:metadata-approved`.
 - SRE agent comments explaining repeats, blocks, dispatches, or no-change
   outcomes.
 
@@ -113,6 +118,12 @@ Owns approved investigation:
 9. GitHub Actions fetches the SRE context and runs Codex.
 10. Codex opens a draft PR or comments investigation findings without code
    changes.
+
+If Codex determines the right fix is private routing metadata, it comments with
+structured YAML and applies `sre:metadata-suggested` instead of opening a weak
+source-repo PR. A human can apply `sre:metadata-approved` or manually dispatch
+the routing metadata workflow, which opens a reviewed `homelab-config` PR and
+never pushes directly to `main`.
 
 ## Directionality
 

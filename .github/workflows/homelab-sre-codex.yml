@@ -48,7 +48,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  issues: read
+  issues: write
 
 jobs:
   codex:
@@ -139,6 +139,21 @@ jobs:
             echo
             echo "- Review the diff carefully before merge."
           } > codex-output/sre-pr-body.md
+          {
+            echo "# Optional Operational Routing Metadata"
+            echo
+            echo "If this incident is operational dependency noise rather than a source-code fix, write"
+            echo "a YAML suggestion to \`codex-output/sre-routing-metadata.yaml\` with exactly these fields:"
+            echo
+            echo "\`\`\`yaml"
+            echo "source_issue_url: ${{ inputs.issue_url }}"
+            echo "service: ${{ inputs.service_name }}"
+            echo "dependency: <dependency-name>"
+            echo "pattern: <narrow representative log pattern>"
+            echo "reason: <why this should route notify-only instead of source-repo issue>"
+            echo "evidence: <short evidence from issue, diagnostics, code, retry/backoff, or logging behavior>"
+            echo "\`\`\`"
+          } > codex-output/sre-routing-metadata-instructions.md
 
       - name: Run Codex
         id: run_codex
@@ -179,6 +194,8 @@ jobs:
             - Do not introduce abstractions or configurability unless this incident needs them.
             - Do not make adjacent comment, documentation, or UX-only improvements unless they directly fix the triggering incident.
             - If you cannot identify a high-confidence code or configuration fix, leave the working tree clean except ignored `codex-output/` files and report investigation findings in your final response.
+            - If the evidence points to an operational dependency route instead of a source-code fix, do not edit this source repo just to suppress noise. Write `codex-output/sre-routing-metadata.yaml` using the schema in `codex-output/sre-routing-metadata-instructions.md`.
+            - When writing routing metadata, keep `pattern` narrow enough for the representative dependency failure and explain whether the app already has retry/backoff or only needs cleaner logging.
             - Update `codex-output/sre-pr-body.md` with a PR description specific to the issue and actual diff.
             - In the PR description, include `## Issue`, `## Root Cause`, `## Evidence`, `## Fix Logic`, `## Validation`, and `## Remaining Uncertainty`.
             - Include concise, reviewable reasoning grounded in issue context, code references, and test results. Do not include hidden chain-of-thought.
@@ -198,8 +215,61 @@ jobs:
             echo "has_changes=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Check routing metadata suggestion
+        id: check_routing_metadata
+        run: |
+          if [ -s codex-output/sre-routing-metadata.yaml ]; then
+            echo "has_suggestion=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_suggestion=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Report operational routing metadata suggestion
+        if: ${{ steps.check_changes.outputs.has_changes == 'false' && steps.check_routing_metadata.outputs.has_suggestion == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.sre-github-token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh label create "sre:metadata-suggested" \
+            --repo "${{ github.repository }}" \
+            --color "ededed" \
+            --description "SRE suggested homelab-config routing metadata" || true
+          gh issue edit "${ISSUE_NUMBER}" \
+            --repo "${{ github.repository }}" \
+            --add-label "sre:metadata-suggested"
+          {
+            echo "**homelab-sre-agent**"
+            echo
+            echo "Operational routing metadata suggestion created."
+            echo
+            echo "- Result: no source PR was opened because Codex classified this as operational routing metadata."
+            echo "- Metadata owner: \`${{ inputs.deployment_repo }}\`"
+            echo "- Deployment path: \`${{ inputs.deployment_path }}\`"
+            echo "- Run: ${RUN_URL}"
+            echo
+            echo "Apply \`sre:metadata-approved\` or manually dispatch the routing metadata workflow to open a reviewed homelab-config PR."
+            echo
+            echo "## Suggested Metadata"
+            echo
+            echo '```yaml'
+            sed -e 's/\r$//' codex-output/sre-routing-metadata.yaml
+            echo '```'
+            echo
+            echo "## Investigation Findings"
+            echo
+            if [ -s codex-output/codex-final-message.md ]; then
+              sed -e 's/\r$//' codex-output/codex-final-message.md
+            else
+              echo "Codex completed without a final message file."
+            fi
+          } > codex-output/routing-metadata-comment.md
+          gh issue comment "${ISSUE_NUMBER}" \
+            --repo "${{ github.repository }}" \
+            --body-file codex-output/routing-metadata-comment.md
+
       - name: Report investigation without code changes
-        if: ${{ steps.check_changes.outputs.has_changes == 'false' }}
+        if: ${{ steps.check_changes.outputs.has_changes == 'false' && steps.check_routing_metadata.outputs.has_suggestion == 'false' }}
         env:
           GH_TOKEN: ${{ secrets.sre-github-token }}
           ISSUE_NUMBER: ${{ inputs.issue_number }}
@@ -248,6 +318,7 @@ jobs:
           FETCH_CONTEXT_OUTCOME: ${{ steps.fetch_context.outcome || 'not_run' }}
           RUN_CODEX_OUTCOME: ${{ steps.run_codex.outcome || 'not_run' }}
           CHECK_CHANGES_OUTCOME: ${{ steps.check_changes.outcome || 'not_run' }}
+          CHECK_ROUTING_METADATA_OUTCOME: ${{ steps.check_routing_metadata.outcome || 'not_run' }}
           CREATE_PR_OUTCOME: ${{ steps.create_pr.outcome || 'not_run' }}
         run: |
           mkdir -p codex-output
@@ -265,6 +336,7 @@ jobs:
             echo "  - Context fetch: \`${FETCH_CONTEXT_OUTCOME}\`"
             echo "  - Codex: \`${RUN_CODEX_OUTCOME}\`"
             echo "  - Change check: \`${CHECK_CHANGES_OUTCOME}\`"
+            echo "  - Routing metadata check: \`${CHECK_ROUTING_METADATA_OUTCOME}\`"
             echo "  - Draft PR: \`${CREATE_PR_OUTCOME}\`"
             echo
             echo "Review the workflow run logs, fix the workflow or repo configuration, then dispatch autofix again."

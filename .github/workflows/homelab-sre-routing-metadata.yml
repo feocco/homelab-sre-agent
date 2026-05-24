@@ -1,0 +1,163 @@
+name: Homelab SRE Routing Metadata PR
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_repo:
+        description: Source issue repository, for example feocco/plant-monitor
+        required: true
+        type: string
+      issue_number:
+        description: Source issue number containing an approved metadata suggestion
+        required: true
+        type: string
+  issues:
+    types: [labeled]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  homelab-config-pr:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.label.name == 'sre:metadata-approved' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve source issue
+        id: source
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "issue_repo=${{ inputs.issue_repo }}" >> "$GITHUB_OUTPUT"
+            echo "issue_number=${{ inputs.issue_number }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "issue_repo=${{ github.repository }}" >> "$GITHUB_OUTPUT"
+            echo "issue_number=${{ github.event.issue.number }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout SRE agent
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          path: homelab-sre-agent
+          persist-credentials: false
+
+      - name: Checkout homelab-config
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: feocco/homelab-config
+          token: ${{ secrets.SRE_GITHUB_TOKEN }}
+          path: homelab-config
+          persist-credentials: false
+
+      - name: Install metadata updater dependencies
+        run: python -m pip install "PyYAML>=6,<7"
+
+      - name: Fetch approved suggestion
+        env:
+          GH_TOKEN: ${{ secrets.SRE_GITHUB_TOKEN }}
+          ISSUE_REPO: ${{ steps.source.outputs.issue_repo }}
+          ISSUE_NUMBER: ${{ steps.source.outputs.issue_number }}
+        run: |
+          mkdir -p work
+          gh issue view "${ISSUE_NUMBER}" \
+            --repo "${ISSUE_REPO}" \
+            --json comments,labels,title,url \
+            > work/source-issue.json
+          if ! jq -e '.labels[].name == "sre:metadata-suggested"' work/source-issue.json >/dev/null; then
+            echo "source issue is missing sre:metadata-suggested" >&2
+            exit 1
+          fi
+
+      - name: Apply routing metadata
+        id: apply
+        env:
+          PYTHONPATH: homelab-sre-agent
+        run: |
+          python -m homelab_sre_agent.routing_metadata \
+            --services-yaml homelab-config/services/homelab-sre-agent/services.yaml \
+            --issue-json work/source-issue.json
+          if git -C homelab-config diff --quiet -- services/homelab-sre-agent/services.yaml; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create homelab-config pull request
+        if: ${{ steps.apply.outputs.changed == 'true' }}
+        id: create_pr
+        uses: peter-evans/create-pull-request@c5a7806660adbe173f04e3e038b0ccdcd758773c
+        with:
+          token: ${{ secrets.SRE_GITHUB_TOKEN }}
+          path: homelab-config
+          branch: codex/sre-routing-metadata-${{ steps.source.outputs.issue_number }}
+          title: "SRE: add routing metadata for issue #${{ steps.source.outputs.issue_number }}"
+          body: |
+            ## Summary
+
+            Adds reviewed operational routing metadata suggested by the homelab SRE workflow.
+
+            ## Source Issue
+
+            - Repository: `${{ steps.source.outputs.issue_repo }}`
+            - Issue: #${{ steps.source.outputs.issue_number }}
+
+            ## Safety
+
+            - Opens a PR only; does not push directly to main.
+            - Updates only `services/homelab-sre-agent/services.yaml`.
+            - The metadata suggestion was explicitly approved with `sre:metadata-approved` or workflow dispatch.
+
+      - name: Report metadata PR
+        if: ${{ steps.apply.outputs.changed == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.SRE_GITHUB_TOKEN }}
+          ISSUE_REPO: ${{ steps.source.outputs.issue_repo }}
+          ISSUE_NUMBER: ${{ steps.source.outputs.issue_number }}
+          PR_URL: ${{ steps.create_pr.outputs.pull-request-url }}
+        run: |
+          {
+            echo "**homelab-sre-agent**"
+            echo
+            echo "Opened a reviewed homelab-config PR for the approved operational routing metadata."
+            echo
+            echo "- PR: ${PR_URL}"
+          } > work/metadata-pr-comment.md
+          gh issue comment "${ISSUE_NUMBER}" \
+            --repo "${ISSUE_REPO}" \
+            --body-file work/metadata-pr-comment.md
+
+      - name: Report no-op metadata approval
+        if: ${{ steps.apply.outputs.changed == 'false' }}
+        env:
+          GH_TOKEN: ${{ secrets.SRE_GITHUB_TOKEN }}
+          ISSUE_REPO: ${{ steps.source.outputs.issue_repo }}
+          ISSUE_NUMBER: ${{ steps.source.outputs.issue_number }}
+        run: |
+          {
+            echo "**homelab-sre-agent**"
+            echo
+            echo "Approved operational routing metadata was already present in homelab-config, so no PR was opened."
+          } > work/metadata-noop-comment.md
+          gh issue comment "${ISSUE_NUMBER}" \
+            --repo "${ISSUE_REPO}" \
+            --body-file work/metadata-noop-comment.md
+
+      - name: Report metadata workflow failure
+        if: ${{ failure() }}
+        env:
+          GH_TOKEN: ${{ secrets.SRE_GITHUB_TOKEN }}
+          ISSUE_REPO: ${{ steps.source.outputs.issue_repo }}
+          ISSUE_NUMBER: ${{ steps.source.outputs.issue_number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          {
+            echo "**homelab-sre-agent**"
+            echo
+            echo "Operational routing metadata PR workflow failed."
+            echo
+            echo "- Run: ${RUN_URL}"
+            echo "- Result: no homelab-config PR was opened. Review the workflow logs, fix the suggestion or approval, then retry."
+          } > work/metadata-failure-comment.md
+          gh issue comment "${ISSUE_NUMBER}" \
+            --repo "${ISSUE_REPO}" \
+            --body-file work/metadata-failure-comment.md
