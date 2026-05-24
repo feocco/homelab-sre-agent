@@ -25,3 +25,10 @@ services:
       # sre:autofix-approved issue label before dispatching Codex.
       autofix: false
       repo_daily_limit: 1
+      # Optional: route obvious dependency outages to phone notification +
+      # local recurrence state instead of creating a source-repo issue.
+      routing:
+        operational_dependencies:
+          - dependency: home-assistant
+            pattern: "Cannot connect to host *.ui.nabu.casa"
+            reason: "Home Assistant cloud endpoint is unavailable."

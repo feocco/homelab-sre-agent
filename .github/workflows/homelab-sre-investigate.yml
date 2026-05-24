@@ -21,6 +21,8 @@ jobs:
       deployment_repo: ${{ github.event.client_payload.deployment_repo }}
       deployment_path: ${{ github.event.client_payload.deployment_path }}
       diagnostic_url: ${{ github.event.client_payload.diagnostic_url || '' }}
+      diagnostic_uploaded_at: ${{ github.event.client_payload.diagnostic_uploaded_at || '' }}
+      diagnostic_expires_at: ${{ github.event.client_payload.diagnostic_expires_at || '' }}
     secrets:
       openai-api-key: ${{ secrets.OPENAI_API_KEY }}
       sre-github-token: ${{ secrets.SRE_GITHUB_TOKEN }}

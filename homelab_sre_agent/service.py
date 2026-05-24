@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from fnmatch import fnmatch
 import hashlib
 import logging
 import re
@@ -14,7 +15,7 @@ from .github import GitHubClient, GitHubIssue, IssueResult
 from .metadata import ServiceCatalog, ServiceMetadata
 from .notifications import IssueNotifier, PHONE_APPROVAL_TOKEN_TTL_SECONDS, make_approval_action
 from .redact import redact_text
-from .state import CommentRollup, RecurrenceSummary, StateStore, utc_now
+from .state import CommentRollup, RecurrenceSummary, StateStore, format_dt, parse_dt, utc_now
 
 
 LOGGER = logging.getLogger("homelab-sre-agent")
@@ -36,7 +37,7 @@ AUTOFIX_LABELS = {
 
 
 class DiagnosticPublisher(Protocol):
-    def publish(
+    def upload(
         self,
         *,
         service: ServiceMetadata,
@@ -46,6 +47,8 @@ class DiagnosticPublisher(Protocol):
         recurrence: RecurrenceSummary,
         now: datetime,
     ) -> str: ...
+
+    def presign(self, object_key: str) -> str: ...
 
 
 @dataclass(frozen=True)
@@ -100,6 +103,13 @@ class IssueAnalysis:
     representative_line: str
 
 
+@dataclass(frozen=True)
+class OperationalRoute:
+    fingerprint: str
+    dependency: str
+    reason: str
+
+
 class SREService:
     def __init__(
         self,
@@ -138,6 +148,15 @@ class SREService:
         bundle = self._write_diagnostic_bundle(service, incident, raw_logs, now)
         analysis = analyze_incident(incident, raw_logs)
         sanitized_line = redact_text(analysis.representative_line, limit=MAX_PUBLIC_LINE_CHARS)
+        operational_route = classify_operational_route(service, analysis)
+        if operational_route is not None:
+            return self._handle_operational_incident(
+                service=service,
+                route=operational_route,
+                line=sanitized_line,
+                bundle=bundle,
+                now=now,
+            )
         state_key = self._state_key(service, incident, raw_logs, now)
         claim = self.state.claim_issue_for_incident(
             fingerprint=state_key,
@@ -186,6 +205,14 @@ class SREService:
                 issue_action = "created"
             issue_result = issue
             self.state.set_issue(fingerprint=state_key, issue_number=issue.number, issue_url=issue.url, now=now)
+            self._upload_diagnostic_summary(
+                service=service,
+                issue=issue_result,
+                state_key=state_key,
+                diagnostic_reference=bundle.reference,
+                recurrence=recurrence,
+                now=now,
+            )
             if issue_action == "created":
                 self._notify_issue_created(service, incident, analysis, sanitized_line, state_key, issue, now)
         elif claim.action == "issue_creation_in_flight":
@@ -221,6 +248,15 @@ class SREService:
                 )
                 self.state.mark_comment_sent(fingerprint=state_key, now=now)
             issue_action = "updated"
+            if issue_result.number:
+                self._upload_diagnostic_summary(
+                    service=service,
+                    issue=issue_result,
+                    state_key=state_key,
+                    diagnostic_reference=bundle.reference,
+                    recurrence=recurrence,
+                    now=now,
+                )
 
         dispatch = self._autofix_wait_status(service)
         LOGGER.info("%s issue for %s fingerprint=%s", issue_action, service.name, incident.fingerprint[:12])
@@ -230,6 +266,100 @@ class SREService:
             "service": service.name,
             "issue": {"repo": issue_result.repo, "number": issue_result.number, "url": issue_result.url},
             "dispatch": dispatch,
+            "diagnostic": {"path": bundle.path, "reference": bundle.reference},
+            "dry_run": self.config.dry_run,
+        }
+
+    def _upload_diagnostic_summary(
+        self,
+        *,
+        service: ServiceMetadata,
+        issue: IssueResult,
+        state_key: str,
+        diagnostic_reference: str,
+        recurrence: RecurrenceSummary,
+        now: datetime,
+    ) -> None:
+        if self.diagnostic_publisher is None:
+            return
+        try:
+            object_key = self.diagnostic_publisher.upload(
+                service=service,
+                issue=issue,
+                state_key=state_key,
+                diagnostic_reference=diagnostic_reference,
+                recurrence=recurrence,
+                now=now,
+            )
+        except Exception:
+            LOGGER.exception("Could not upload diagnostic context for %s", state_key)
+            return
+        self.state.set_diagnostic_object_key(fingerprint=state_key, object_key=object_key, uploaded_at=now)
+
+    def _handle_operational_incident(
+        self,
+        *,
+        service: ServiceMetadata,
+        route: OperationalRoute,
+        line: str,
+        bundle: DiagnosticBundle,
+        now: datetime,
+    ) -> dict[str, Any]:
+        record = self.state.record_operational_observation(
+            fingerprint=route.fingerprint,
+            service_name=service.name,
+            issue_repo=service.issue_repo,
+            dependency=route.dependency,
+            reason=route.reason,
+            observed_at=now,
+            line=line,
+            diagnostic_reference=bundle.reference,
+        )
+        notification_sent = False
+        notification_reason = "disabled"
+        if self.config.issue_notifications_enabled and self.issue_notifier is not None:
+            last_notification_at = parse_dt(record.last_notification_at)
+            if (
+                last_notification_at is None
+                or now - last_notification_at >= timedelta(seconds=self.config.operational_notification_cooldown_seconds)
+            ):
+                try:
+                    self.issue_notifier.send_operational_incident(
+                        service=service,
+                        dependency=record.dependency,
+                        reason=record.reason,
+                        line=record.latest_line,
+                        total_count=record.total_count,
+                        latest_seen_at=record.latest_seen_at,
+                    )
+                except Exception:
+                    LOGGER.exception("Failed to send SRE operational notification")
+                    notification_reason = "send_failed"
+                else:
+                    record = self.state.mark_operational_notification_sent(fingerprint=route.fingerprint, now=now)
+                    notification_sent = True
+                    notification_reason = "sent"
+            else:
+                notification_reason = "cooldown"
+
+        LOGGER.info(
+            "Routed operational incident for %s dependency=%s fingerprint=%s",
+            service.name,
+            route.dependency,
+            route.fingerprint[:12],
+        )
+        return {
+            "ok": True,
+            "status": "operational_dependency",
+            "service": service.name,
+            "issue": None,
+            "route": {
+                "classification": "operational_dependency",
+                "fingerprint": route.fingerprint,
+                "dependency": route.dependency,
+                "reason": route.reason,
+            },
+            "notification": {"sent": notification_sent, "reason": notification_reason},
             "diagnostic": {"path": bundle.path, "reference": bundle.reference},
             "dry_run": self.config.dry_run,
         }
@@ -371,19 +501,13 @@ class SREService:
         }
         record = self.state.get_incident(state_key)
         if self.diagnostic_publisher is not None and record is not None:
-            recurrence = self.state.recurrence_summary(fingerprint=state_key, now=now)
             reference = record.latest_diagnostic_reference or ""
-            if reference:
+            object_key = record.latest_diagnostic_object_key or ""
+            if reference and object_key:
                 try:
-                    payload["diagnostic_url"] = self.diagnostic_publisher.publish(
-                        service=service,
-                        issue=issue,
-                        state_key=state_key,
-                        diagnostic_reference=reference,
-                        recurrence=recurrence,
-                        now=now,
-                    )
+                    payload["diagnostic_url"] = self.diagnostic_publisher.presign(object_key)
                     payload["diagnostic_reference"] = reference
+                    payload.update(self._diagnostic_retention_payload(record))
                 except Exception:
                     LOGGER.exception("Could not publish diagnostic context for %s", state_key)
         self.github.repository_dispatch(
@@ -403,6 +527,16 @@ class SREService:
             "event_type": "homelab-sre-investigate",
             "branch": branch,
         }
+
+    def _diagnostic_retention_payload(self, record) -> dict[str, str]:
+        uploaded_at = parse_dt(record.latest_diagnostic_uploaded_at)
+        if uploaded_at is None:
+            return {}
+        payload = {"diagnostic_uploaded_at": format_dt(uploaded_at)}
+        if self.config.diagnostic_retention_days > 0:
+            expires_at = uploaded_at + timedelta(days=self.config.diagnostic_retention_days)
+            payload["diagnostic_expires_at"] = format_dt(expires_at)
+        return payload
 
     def ensure_autofix_labels(self) -> None:
         self._ensure_autofix_labels(self._autofix_issue_repos(self._catalog()))
@@ -810,6 +944,66 @@ def analyze_incident(incident: Incident, raw_logs: str) -> IssueAnalysis:
         observed=f"The service logged: {clean}",
         expected="The service should run without unexpected ERROR/WARN log events.",
         representative_line=representative,
+    )
+
+
+def classify_operational_route(
+    service: ServiceMetadata,
+    analysis: IssueAnalysis,
+) -> OperationalRoute | None:
+    clean = strip_log_timestamp(analysis.representative_line)
+    lower = clean.lower()
+
+    for rule in service.operational_dependency_rules:
+        pattern = rule.pattern.lower()
+        if fnmatch(lower, pattern) or fnmatch(lower, f"*{pattern}*"):
+            return operational_route(
+                service=service,
+                dependency=rule.dependency,
+                reason=rule.reason,
+                signature=rule.pattern,
+            )
+
+    if "homelab.client.homelabfunctionserror" in lower and "500 internal server error" in lower:
+        return operational_route(
+            service=service,
+            dependency="homelab-functions",
+            reason="homelab-functions returned 500, so the event is classified as downstream service unavailability.",
+            signature="homelab.client.HomelabFunctionsError: 500 Internal Server Error",
+        )
+
+    transient_network = (
+        "cannot connect" in lower
+        or "connection refused" in lower
+        or "temporary failure" in lower
+        or "timed out" in lower
+        or "timeout" in lower
+    )
+    if ".ui.nabu.casa" in lower and transient_network:
+        return operational_route(
+            service=service,
+            dependency="home-assistant-cloud",
+            reason="Home Assistant cloud endpoint was temporarily unreachable.",
+            signature="home-assistant-cloud transient connection failure",
+        )
+
+    return None
+
+
+def operational_route(
+    *,
+    service: ServiceMetadata,
+    dependency: str,
+    reason: str,
+    signature: str,
+) -> OperationalRoute:
+    digest = hashlib.sha256(
+        "|".join((service.name, dependency, normalize_for_key(signature))).encode("utf-8")
+    ).hexdigest()
+    return OperationalRoute(
+        fingerprint=f"operational:{service.name}:{digest}",
+        dependency=dependency,
+        reason=reason,
     )
 
 

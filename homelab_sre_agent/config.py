@@ -27,6 +27,7 @@ class Config:
     diagnostic_max_bytes: int
     investigation_cooldown_seconds: int
     issue_comment_cooldown_seconds: int
+    operational_notification_cooldown_seconds: int
     codex_global_daily_limit: int
     approval_poll_seconds: int
     issue_notifications_enabled: bool
@@ -36,6 +37,7 @@ class Config:
     diagnostic_s3_region: str | None
     diagnostic_s3_prefix: str
     diagnostic_url_ttl_seconds: int
+    diagnostic_retention_days: int
     service_host: str
     service_port: int
     http_timeout_seconds: float
@@ -65,6 +67,7 @@ class Config:
             diagnostic_max_bytes=parse_int("SRE_DIAGNOSTIC_MAX_BYTES", 1_000_000),
             investigation_cooldown_seconds=parse_int("SRE_INVESTIGATION_COOLDOWN_SECONDS", 86400),
             issue_comment_cooldown_seconds=parse_int("SRE_ISSUE_COMMENT_COOLDOWN_SECONDS", 3600),
+            operational_notification_cooldown_seconds=parse_int("SRE_OPERATIONAL_NOTIFICATION_COOLDOWN_SECONDS", 3600),
             codex_global_daily_limit=parse_int("SRE_CODEX_GLOBAL_DAILY_LIMIT", 3),
             approval_poll_seconds=parse_int("SRE_APPROVAL_POLL_SECONDS", 300),
             issue_notifications_enabled=parse_bool(os.environ.get("SRE_ISSUE_NOTIFICATIONS_ENABLED"), False),
@@ -74,6 +77,7 @@ class Config:
             diagnostic_s3_region=optional(os.environ.get("SRE_DIAGNOSTIC_S3_REGION")),
             diagnostic_s3_prefix=os.environ.get("SRE_DIAGNOSTIC_S3_PREFIX", "diagnostics").strip().strip("/") or "diagnostics",
             diagnostic_url_ttl_seconds=parse_int("SRE_DIAGNOSTIC_URL_TTL_SECONDS", 3600),
+            diagnostic_retention_days=parse_int("SRE_DIAGNOSTIC_RETENTION_DAYS", 14),
             service_host=os.environ.get("SERVICE_HOST", "0.0.0.0"),
             service_port=parse_int("SERVICE_PORT", 8094),
             http_timeout_seconds=float(os.environ.get("SRE_HTTP_TIMEOUT_SECONDS", "10")),

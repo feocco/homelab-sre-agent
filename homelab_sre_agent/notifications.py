@@ -68,6 +68,34 @@ class IssueNotifier:
             buttons=buttons,
         )
 
+    def send_operational_incident(
+        self,
+        *,
+        service: ServiceMetadata,
+        dependency: str,
+        reason: str,
+        line: str,
+        total_count: int,
+        latest_seen_at: str,
+    ) -> dict[str, Any]:
+        message = "\n".join(
+            [
+                f"Service: {service.name}",
+                f"Dependency: {dependency}",
+                f"Observed: {total_count} total",
+                f"Latest seen: {latest_seen_at}",
+                f"Reason: {reason}",
+                f"Log: {truncate(line, 500)}",
+                "No GitHub issue was created because this is classified as operational/downstream.",
+            ]
+        )
+        return self.notify_func(
+            f"SRE operational - {service.name}",
+            message,
+            tag=f"homelab-sre-operational-{service.name}-{dependency}",
+            group="homelab-sre-operational",
+        )
+
 
 class PhoneApprovalListener:
     def __init__(self, service: SREService, *, reconnect_seconds: int = 15) -> None:

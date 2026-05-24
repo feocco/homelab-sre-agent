@@ -19,7 +19,7 @@ class S3DiagnosticPublisher:
     region_name: str | None = None
     s3_client: Any | None = None
 
-    def publish(
+    def upload(
         self,
         *,
         service: ServiceMetadata,
@@ -53,10 +53,14 @@ class S3DiagnosticPublisher:
             ContentType="application/json",
             ServerSideEncryption="AES256",
         )
+        return key
+
+    def presign(self, object_key: str) -> str:
+        client = self.s3_client or self._client()
         return str(
             client.generate_presigned_url(
                 "get_object",
-                Params={"Bucket": self.bucket, "Key": key},
+                Params={"Bucket": self.bucket, "Key": object_key},
                 ExpiresIn=self.url_ttl_seconds,
             )
         )

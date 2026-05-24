@@ -45,6 +45,8 @@ class IncidentRecord:
     pending_comment_line: str | None
     pending_comment_bundle_reference: str | None
     latest_diagnostic_reference: str | None
+    latest_diagnostic_object_key: str | None
+    latest_diagnostic_uploaded_at: str | None
 
 
 @dataclass(frozen=True)
@@ -83,6 +85,22 @@ class PhoneApprovalToken:
     issue_number: int
     issue_url: str
     created_at: str
+
+
+@dataclass(frozen=True)
+class OperationalIncidentRecord:
+    fingerprint: str
+    service_name: str
+    issue_repo: str
+    dependency: str
+    reason: str
+    first_seen_at: str
+    latest_seen_at: str
+    total_count: int
+    latest_line: str
+    latest_diagnostic_reference: str
+    last_notification_at: str | None
+    notification_count: int
 
 
 class StateStore:
@@ -147,6 +165,21 @@ class StateStore:
                   representative_line TEXT NOT NULL,
                   diagnostic_reference TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS operational_incidents (
+                  fingerprint TEXT PRIMARY KEY,
+                  service_name TEXT NOT NULL,
+                  issue_repo TEXT NOT NULL,
+                  dependency TEXT NOT NULL,
+                  reason TEXT NOT NULL,
+                  first_seen_at TEXT NOT NULL,
+                  latest_seen_at TEXT NOT NULL,
+                  total_count INTEGER NOT NULL,
+                  latest_line TEXT NOT NULL,
+                  latest_diagnostic_reference TEXT NOT NULL,
+                  last_notification_at TEXT,
+                  notification_count INTEGER NOT NULL DEFAULT 0
+                );
                 """
             )
             self._ensure_column("incidents", "issue_create_claimed_at", "TEXT")
@@ -158,7 +191,93 @@ class StateStore:
             self._ensure_column("incidents", "pending_comment_line", "TEXT")
             self._ensure_column("incidents", "pending_comment_bundle_reference", "TEXT")
             self._ensure_column("incidents", "latest_diagnostic_reference", "TEXT")
+            self._ensure_column("incidents", "latest_diagnostic_object_key", "TEXT")
+            self._ensure_column("incidents", "latest_diagnostic_uploaded_at", "TEXT")
             self.connection.commit()
+
+    def record_operational_observation(
+        self,
+        *,
+        fingerprint: str,
+        service_name: str,
+        issue_repo: str,
+        dependency: str,
+        reason: str,
+        observed_at: datetime,
+        line: str,
+        diagnostic_reference: str,
+    ) -> OperationalIncidentRecord:
+        timestamp = format_dt(observed_at)
+        with self._lock:
+            existing = self.get_operational_incident(fingerprint)
+            if existing is None:
+                self.connection.execute(
+                    """
+                    INSERT INTO operational_incidents (
+                      fingerprint,
+                      service_name,
+                      issue_repo,
+                      dependency,
+                      reason,
+                      first_seen_at,
+                      latest_seen_at,
+                      total_count,
+                      latest_line,
+                      latest_diagnostic_reference
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                    """,
+                    (
+                        fingerprint,
+                        service_name,
+                        issue_repo,
+                        dependency,
+                        reason,
+                        timestamp,
+                        timestamp,
+                        line,
+                        diagnostic_reference,
+                    ),
+                )
+            else:
+                self.connection.execute(
+                    """
+                    UPDATE operational_incidents
+                    SET latest_seen_at = ?,
+                        total_count = total_count + 1,
+                        latest_line = ?,
+                        latest_diagnostic_reference = ?
+                    WHERE fingerprint = ?
+                    """,
+                    (timestamp, line, diagnostic_reference, fingerprint),
+                )
+            self.connection.commit()
+            record = self.get_operational_incident(fingerprint)
+            assert record is not None
+            return record
+
+    def get_operational_incident(self, fingerprint: str) -> OperationalIncidentRecord | None:
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT * FROM operational_incidents WHERE fingerprint = ?",
+                (fingerprint,),
+            ).fetchone()
+            return operational_incident_from_row(row)
+
+    def mark_operational_notification_sent(self, *, fingerprint: str, now: datetime) -> OperationalIncidentRecord:
+        with self._lock:
+            self.connection.execute(
+                """
+                UPDATE operational_incidents
+                SET last_notification_at = ?,
+                    notification_count = notification_count + 1
+                WHERE fingerprint = ?
+                """,
+                (format_dt(now), fingerprint),
+            )
+            self.connection.commit()
+            record = self.get_operational_incident(fingerprint)
+            assert record is not None
+            return record
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
         rows = self.connection.execute(f"PRAGMA table_info({table})").fetchall()
@@ -372,6 +491,19 @@ class StateStore:
             self.connection.commit()
             return self.recurrence_summary(fingerprint=fingerprint, now=observed_at)
 
+    def set_diagnostic_object_key(self, *, fingerprint: str, object_key: str, uploaded_at: datetime) -> None:
+        with self._lock:
+            self.connection.execute(
+                """
+                UPDATE incidents
+                SET latest_diagnostic_object_key = ?,
+                    latest_diagnostic_uploaded_at = ?
+                WHERE fingerprint = ?
+                """,
+                (object_key, format_dt(uploaded_at), fingerprint),
+            )
+            self.connection.commit()
+
     def recurrence_summary(self, *, fingerprint: str, now: datetime) -> RecurrenceSummary:
         with self._lock:
             rows = self.connection.execute(
@@ -581,6 +713,31 @@ def incident_from_row(row: sqlite3.Row | None) -> IncidentRecord | None:
         if row["pending_comment_bundle_reference"]
         else None,
         latest_diagnostic_reference=str(row["latest_diagnostic_reference"]) if row["latest_diagnostic_reference"] else None,
+        latest_diagnostic_object_key=str(row["latest_diagnostic_object_key"])
+        if row["latest_diagnostic_object_key"]
+        else None,
+        latest_diagnostic_uploaded_at=str(row["latest_diagnostic_uploaded_at"])
+        if row["latest_diagnostic_uploaded_at"]
+        else None,
+    )
+
+
+def operational_incident_from_row(row: sqlite3.Row | None) -> OperationalIncidentRecord | None:
+    if row is None:
+        return None
+    return OperationalIncidentRecord(
+        fingerprint=str(row["fingerprint"]),
+        service_name=str(row["service_name"]),
+        issue_repo=str(row["issue_repo"]),
+        dependency=str(row["dependency"]),
+        reason=str(row["reason"]),
+        first_seen_at=str(row["first_seen_at"]),
+        latest_seen_at=str(row["latest_seen_at"]),
+        total_count=int(row["total_count"]),
+        latest_line=str(row["latest_line"]),
+        latest_diagnostic_reference=str(row["latest_diagnostic_reference"]),
+        last_notification_at=str(row["last_notification_at"]) if row["last_notification_at"] else None,
+        notification_count=int(row["notification_count"] or 0),
     )
 
 

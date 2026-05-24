@@ -9,6 +9,13 @@ import yaml
 
 
 @dataclass(frozen=True)
+class OperationalDependencyRule:
+    dependency: str
+    pattern: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class ServiceMetadata:
     name: str
     containers: tuple[str, ...]
@@ -23,6 +30,7 @@ class ServiceMetadata:
     sre_enabled: bool = False
     autofix: bool = False
     repo_daily_limit: int = 1
+    operational_dependency_rules: tuple[OperationalDependencyRule, ...] = field(default_factory=tuple)
     unknown: bool = False
 
 
@@ -89,6 +97,7 @@ def load_catalog(path: Path, *, default_issue_repo: str) -> ServiceCatalog:
                 sre_enabled=parse_bool(sre.get("enabled"), False),
                 autofix=parse_bool(sre.get("autofix"), False),
                 repo_daily_limit=parse_int(sre.get("repo_daily_limit"), 1),
+                operational_dependency_rules=parse_operational_dependency_rules(sre.get("routing")),
             )
         )
     return ServiceCatalog(services=tuple(services), default_issue_repo=fallback_issue_repo)
@@ -109,8 +118,29 @@ def unknown_service(container_name: str, default_issue_repo: str) -> ServiceMeta
         sre_enabled=False,
         autofix=False,
         repo_daily_limit=0,
+        operational_dependency_rules=(),
         unknown=True,
     )
+
+
+def parse_operational_dependency_rules(value: Any) -> tuple[OperationalDependencyRule, ...]:
+    if not isinstance(value, dict):
+        return ()
+    raw_rules = value.get("operational_dependencies") or ()
+    if not isinstance(raw_rules, list):
+        return ()
+
+    rules: list[OperationalDependencyRule] = []
+    for raw in raw_rules:
+        if not isinstance(raw, dict):
+            continue
+        dependency = optional_str(raw.get("dependency"))
+        pattern = optional_str(raw.get("pattern"))
+        if not dependency or not pattern:
+            continue
+        reason = optional_str(raw.get("reason")) or f"{dependency} matched an operational dependency routing rule."
+        rules.append(OperationalDependencyRule(dependency=dependency, pattern=pattern, reason=reason))
+    return tuple(rules)
 
 
 def optional_str(value: Any) -> str | None:

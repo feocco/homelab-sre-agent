@@ -144,13 +144,32 @@ class FakeNotifier:
         return {"status": "sent"}
 
 
+class FailingNotifier:
+    def notify(self, title: str, message: str, **kwargs):
+        raise RuntimeError("notification path unavailable")
+
+
 class FakeDiagnosticPublisher:
     def __init__(self) -> None:
-        self.calls = []
+        self.uploads = []
+        self.urls = []
 
-    def publish(self, *, service, issue, state_key, diagnostic_reference, recurrence, now):
-        self.calls.append((service.name, issue.number, state_key, diagnostic_reference, recurrence.total_count))
-        return f"https://diagnostics.example/{issue.number}?signature=short-lived"
+    def upload(self, *, service, issue, state_key, diagnostic_reference, recurrence, now):
+        key = f"diagnostics/{service.name}/issue-{issue.number}/{len(self.uploads) + 1}.json"
+        self.uploads.append((service.name, issue.number, state_key, diagnostic_reference, recurrence.total_count, key))
+        return key
+
+    def presign(self, object_key):
+        self.urls.append(object_key)
+        return f"https://diagnostics.example/{object_key}?signature=short-lived"
+
+
+class FailingDiagnosticPublisher:
+    def upload(self, *, service, issue, state_key, diagnostic_reference, recurrence, now):
+        raise RuntimeError("s3 unavailable")
+
+    def presign(self, object_key):
+        raise AssertionError("presign should not run without an uploaded object key")
 
 
 def make_config(
@@ -160,6 +179,7 @@ def make_config(
     episode_window_seconds: int = 120,
     investigation_cooldown_seconds: int = 86400,
     issue_comment_cooldown_seconds: int = 3600,
+    operational_notification_cooldown_seconds: int = 3600,
     issue_notifications_enabled: bool = False,
     phone_approvals_enabled: bool = False,
     codex_global_daily_limit: int = 3,
@@ -184,6 +204,7 @@ def make_config(
         diagnostic_max_bytes=1_000_000,
         investigation_cooldown_seconds=investigation_cooldown_seconds,
         issue_comment_cooldown_seconds=issue_comment_cooldown_seconds,
+        operational_notification_cooldown_seconds=operational_notification_cooldown_seconds,
         codex_global_daily_limit=codex_global_daily_limit,
         approval_poll_seconds=300,
         issue_notifications_enabled=issue_notifications_enabled,
@@ -193,6 +214,7 @@ def make_config(
         diagnostic_s3_region=None,
         diagnostic_s3_prefix="diagnostics",
         diagnostic_url_ttl_seconds=3600,
+        diagnostic_retention_days=14,
         service_host="127.0.0.1",
         service_port=8094,
         http_timeout_seconds=10,
@@ -334,6 +356,7 @@ class ServiceTests(TestCase):
         episode_window_seconds: int = 120,
         investigation_cooldown_seconds: int = 86400,
         issue_comment_cooldown_seconds: int = 3600,
+        operational_notification_cooldown_seconds: int = 3600,
         github: GitHubClient | None = None,
         issue_notifier=None,
         issue_notifications_enabled: bool = False,
@@ -350,6 +373,7 @@ class ServiceTests(TestCase):
             episode_window_seconds=episode_window_seconds,
             investigation_cooldown_seconds=investigation_cooldown_seconds,
             issue_comment_cooldown_seconds=issue_comment_cooldown_seconds,
+            operational_notification_cooldown_seconds=operational_notification_cooldown_seconds,
             issue_notifications_enabled=issue_notifications_enabled,
             phone_approvals_enabled=phone_approvals_enabled,
             codex_global_daily_limit=codex_global_daily_limit,
@@ -602,7 +626,8 @@ services:
         self.assertIn("sent `repository_dispatch`", github.dry_run_actions[-1]["body"])
         self.assertIn("**homelab-sre-agent**", github.dry_run_actions[-1]["body"])
 
-    def test_autofix_dispatch_includes_published_diagnostic_url(self) -> None:
+    def test_incident_time_diagnostic_upload_is_presigned_at_autofix_dispatch(self) -> None:
+        clock = FakeClock()
         github = FakeGitHub()
         publisher = FakeDiagnosticPublisher()
         tmp, service, github = self.make_service(
@@ -621,6 +646,52 @@ services:
             investigation_cooldown_seconds=0,
             github=github,
             diagnostic_publisher=publisher,
+            now_func=clock.now,
+        )
+        self.addCleanup(tmp.cleanup)
+
+        result = service.handle_incident(payload(fingerprint="fingerprint-one"))
+        issue_key = ("feocco/plant-monitor", result["issue"]["number"])
+        self.assertEqual(len(publisher.uploads), 1)
+        self.assertEqual(publisher.uploads[0][1], result["issue"]["number"])
+        record = service.state.get_incident_by_issue(issue_repo=issue_key[0], issue_number=issue_key[1])
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.latest_diagnostic_object_key, publisher.uploads[0][5])
+
+        github.add_issue_labels(repo=issue_key[0], issue_number=issue_key[1], labels=[AUTOFIX_APPROVED_LABEL])
+        service.poll_autofix_approvals()
+
+        dispatch_actions = [action for action in github.dry_run_actions if action["action"] == "repository_dispatch"]
+        self.assertEqual(len(dispatch_actions), 1)
+        client_payload = dispatch_actions[0]["client_payload"]
+        self.assertEqual(
+            client_payload["diagnostic_url"],
+            f"https://diagnostics.example/{publisher.uploads[0][5]}?signature=short-lived",
+        )
+        self.assertEqual(client_payload["diagnostic_reference"].startswith("/nas/diagnostics/plant-monitor/"), True)
+        self.assertEqual(client_payload["diagnostic_uploaded_at"], "2026-05-09T05:00:00+00:00")
+        self.assertEqual(client_payload["diagnostic_expires_at"], "2026-05-23T05:00:00+00:00")
+        self.assertEqual(publisher.urls, [publisher.uploads[0][5]])
+
+    def test_diagnostic_upload_failure_does_not_block_issue_or_dispatch(self) -> None:
+        github = FakeGitHub()
+        tmp, service, github = self.make_service(
+            """
+services:
+  plant-monitor:
+    containers: [plant-monitor]
+    source:
+      repo: feocco/plant-monitor
+    sre:
+      enabled: true
+      autofix: true
+      repo_daily_limit: 1
+""",
+            episode_window_seconds=0,
+            investigation_cooldown_seconds=0,
+            github=github,
+            diagnostic_publisher=FailingDiagnosticPublisher(),
         )
         self.addCleanup(tmp.cleanup)
 
@@ -632,9 +703,8 @@ services:
         dispatch_actions = [action for action in github.dry_run_actions if action["action"] == "repository_dispatch"]
         self.assertEqual(len(dispatch_actions), 1)
         client_payload = dispatch_actions[0]["client_payload"]
-        self.assertEqual(client_payload["diagnostic_url"], "https://diagnostics.example/2?signature=short-lived")
-        self.assertEqual(client_payload["diagnostic_reference"].startswith("/nas/diagnostics/plant-monitor/"), True)
-        self.assertEqual(publisher.calls[0][4], 1)
+        self.assertNotIn("diagnostic_url", client_payload)
+        self.assertNotIn("diagnostic_reference", client_payload)
 
     def test_new_issue_sends_phone_notification_with_approval_button(self) -> None:
         github = FakeGitHub()
@@ -691,6 +761,170 @@ services:
         service.handle_incident(payload())
         service.handle_incident(payload())
 
+        self.assertEqual(len(fake_notifier.calls), 1)
+
+    def test_homelab_functions_500_routes_to_operational_notification_without_issue(self) -> None:
+        fake_notifier = FakeNotifier()
+        tmp, service, github = self.make_service(
+            """
+services:
+  homelab-sre-agent:
+    containers: [homelab-sre-agent]
+    source:
+      repo: feocco/homelab-sre-agent
+    sre:
+      enabled: true
+      autofix: true
+""",
+            logs="ERROR homelab.client.HomelabFunctionsError: 500 Internal Server Error",
+            issue_notifier=IssueNotifier(fake_notifier.notify),
+            issue_notifications_enabled=True,
+        )
+        self.addCleanup(tmp.cleanup)
+
+        result = service.handle_incident(payload(container="homelab-sre-agent"))
+
+        self.assertEqual(result["status"], "operational_dependency")
+        self.assertEqual(result["route"]["dependency"], "homelab-functions")
+        self.assertIsNone(result["issue"])
+        self.assertNotIn("create_issue", [action["action"] for action in github.dry_run_actions])
+        self.assertEqual(len(fake_notifier.calls), 1)
+        title, message, kwargs = fake_notifier.calls[0]
+        self.assertEqual(title, "SRE operational - homelab-sre-agent")
+        self.assertIn("Dependency: homelab-functions", message)
+        self.assertIn("No GitHub issue was created", message)
+        self.assertEqual(kwargs["group"], "homelab-sre-operational")
+        record = service.state.get_operational_incident(result["route"]["fingerprint"])
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.notification_count, 1)
+        self.assertEqual(record.total_count, 1)
+
+    def test_operational_repeats_inside_cooldown_do_not_notify_or_create_issue(self) -> None:
+        clock = FakeClock()
+        fake_notifier = FakeNotifier()
+        tmp, service, github = self.make_service(
+            """
+services:
+  homelab-sre-agent:
+    containers: [homelab-sre-agent]
+    source:
+      repo: feocco/homelab-sre-agent
+    sre:
+      enabled: true
+""",
+            logs="ERROR homelab.client.HomelabFunctionsError: 500 Internal Server Error",
+            issue_notifier=IssueNotifier(fake_notifier.notify),
+            issue_notifications_enabled=True,
+            now_func=clock.now,
+        )
+        self.addCleanup(tmp.cleanup)
+
+        first = service.handle_incident(payload(container="homelab-sre-agent", fingerprint="first"))
+        clock.advance(120)
+        second = service.handle_incident(payload(container="homelab-sre-agent", fingerprint="second"))
+
+        self.assertEqual(first["status"], "operational_dependency")
+        self.assertEqual(second["status"], "operational_dependency")
+        self.assertFalse(second["notification"]["sent"])
+        self.assertEqual(len(fake_notifier.calls), 1)
+        self.assertNotIn("create_issue", [action["action"] for action in github.dry_run_actions])
+        record = service.state.get_operational_incident(first["route"]["fingerprint"])
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.total_count, 2)
+        self.assertEqual(record.notification_count, 1)
+
+    def test_operational_notification_failure_does_not_create_issue_or_raise(self) -> None:
+        tmp, service, github = self.make_service(
+            """
+services:
+  homelab-sre-agent:
+    containers: [homelab-sre-agent]
+    source:
+      repo: feocco/homelab-sre-agent
+    sre:
+      enabled: true
+""",
+            logs="ERROR homelab.client.HomelabFunctionsError: 500 Internal Server Error",
+            issue_notifier=IssueNotifier(FailingNotifier().notify),
+            issue_notifications_enabled=True,
+        )
+        self.addCleanup(tmp.cleanup)
+
+        result = service.handle_incident(payload(container="homelab-sre-agent"))
+
+        self.assertEqual(result["status"], "operational_dependency")
+        self.assertEqual(result["notification"], {"sent": False, "reason": "send_failed"})
+        self.assertEqual(github.dry_run_actions, [])
+
+    def test_operational_repeats_after_cooldown_send_digest_notification(self) -> None:
+        clock = FakeClock()
+        fake_notifier = FakeNotifier()
+        tmp, service, _github = self.make_service(
+            """
+services:
+  homelab-sre-agent:
+    containers: [homelab-sre-agent]
+    source:
+      repo: feocco/homelab-sre-agent
+    sre:
+      enabled: true
+""",
+            logs="ERROR homelab.client.HomelabFunctionsError: 500 Internal Server Error",
+            operational_notification_cooldown_seconds=300,
+            issue_notifier=IssueNotifier(fake_notifier.notify),
+            issue_notifications_enabled=True,
+            now_func=clock.now,
+        )
+        self.addCleanup(tmp.cleanup)
+
+        service.handle_incident(payload(container="homelab-sre-agent", fingerprint="first"))
+        clock.advance(301)
+        result = service.handle_incident(payload(container="homelab-sre-agent", fingerprint="second"))
+
+        self.assertTrue(result["notification"]["sent"])
+        self.assertEqual(len(fake_notifier.calls), 2)
+        _title, message, _kwargs = fake_notifier.calls[1]
+        self.assertIn("Observed: 2 total", message)
+        self.assertIn("No GitHub issue was created", message)
+        record = service.state.get_operational_incident(result["route"]["fingerprint"])
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.notification_count, 2)
+
+    def test_service_metadata_can_route_operational_dependency_by_pattern(self) -> None:
+        fake_notifier = FakeNotifier()
+        tmp, service, github = self.make_service(
+            """
+services:
+  plant-monitor:
+    containers: [plant-monitor]
+    source:
+      repo: feocco/plant-monitor
+    sre:
+      enabled: true
+      routing:
+        operational_dependencies:
+          - dependency: home-assistant
+            pattern: "Cannot connect to host *.ui.nabu.casa"
+            reason: "Home Assistant cloud endpoint is unavailable."
+""",
+            logs=(
+                "ERROR aiohttp.client_exceptions.ClientConnectorError: "
+                "Cannot connect to host abc123.ui.nabu.casa:443 ssl:default [None]"
+            ),
+            issue_notifier=IssueNotifier(fake_notifier.notify),
+            issue_notifications_enabled=True,
+        )
+        self.addCleanup(tmp.cleanup)
+
+        result = service.handle_incident(payload())
+
+        self.assertEqual(result["status"], "operational_dependency")
+        self.assertEqual(result["route"]["dependency"], "home-assistant")
+        self.assertIn("Home Assistant cloud endpoint is unavailable.", result["route"]["reason"])
+        self.assertEqual(github.dry_run_actions, [])
         self.assertEqual(len(fake_notifier.calls), 1)
 
     def test_non_autofix_issue_notification_only_opens_issue(self) -> None:
