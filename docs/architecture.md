@@ -13,11 +13,14 @@ flowchart LR
 
     sre --> state["SQLite state\nincidents, recurrence,\ncomments, dispatches"]
     sre --> localdiag["NAS diagnostic bundles\nfull local logs"]
+    sre --> route{"code-fix or\noperational?"}
+    route -- "code-fix candidate" --> github
+    route -- "operational/downstream" --> helpers
     sre -- "create/update issues\ncomments, labels" --> github["GitHub Issues"]
     sre -- "poll approval labels" --> github
     sre -- "phone notification\napproval buttons" --> helpers["homelab-functions\nHome Assistant helpers"]
     helpers -- "mobile action events" --> sre
-    sre -- "upload diagnostic summary" --> s3["Private S3 diagnostics bucket"]
+    sre -- "upload incident-time\ndiagnostic summary" --> s3["Private S3 diagnostics bucket"]
     sre -- "repository_dispatch\nwith pre-signed URL" --> workflow["GitHub Actions\nSRE Codex workflow"]
     workflow -- "GET diagnostic summary" --> s3
     workflow --> codex["Codex Cloud"]
@@ -48,10 +51,14 @@ Owns incident coordination:
 - Collects Docker log context through the local Docker socket.
 - Writes full diagnostic bundles on NAS disk.
 - Computes stable incident families and recurrence summaries.
+- Classifies obvious downstream dependency failures as operational notify-only
+  events instead of source-repo code issues.
 - Creates or updates GitHub issues and comments.
 - Sends phone notifications through `homelab-functions`.
 - Polls GitHub labels for approved autofix.
-- On approval, publishes the S3 diagnostic handoff and dispatches the Codex
+- Uploads the bounded S3 diagnostic summary when a code-fix issue is created or
+  updated.
+- On approval, signs the stored diagnostic object and dispatches the Codex
   workflow.
 
 ### `homelab-functions` / Home Assistant
@@ -93,16 +100,18 @@ Owns approved investigation:
 
 1. Log watcher detects a matching Docker log event.
 2. Log watcher sends an incident webhook to SRE agent.
-3. SRE agent writes local diagnostics, records recurrence, and creates or
-   updates a GitHub issue.
-4. A human approves autofix by applying `sre:autofix-approved` or pressing the
+3. SRE agent writes local diagnostics and classifies the incident.
+4. Code-fix candidates create or update a GitHub issue. Operational/downstream
+   incidents record local recurrence and notify with cooldown, but do not create
+   a source-repo issue.
+5. A human approves autofix by applying `sre:autofix-approved` or pressing the
    phone approval action.
-5. SRE agent polls GitHub, sees approval, checks cooldowns and daily limits.
-6. SRE agent uploads a bounded S3 diagnostic summary and signs a temporary URL.
-7. SRE agent sends `repository_dispatch` to the source repo with issue metadata
+6. SRE agent polls GitHub, sees approval, checks cooldowns and daily limits.
+7. SRE agent signs the stored S3 diagnostic summary with a temporary URL.
+8. SRE agent sends `repository_dispatch` to the source repo with issue metadata
    and the diagnostic URL.
-8. GitHub Actions fetches the SRE context and runs Codex.
-9. Codex opens a draft PR or comments investigation findings without code
+9. GitHub Actions fetches the SRE context and runs Codex.
+10. Codex opens a draft PR or comments investigation findings without code
    changes.
 
 ## Directionality
@@ -111,7 +120,7 @@ All cloud communication is outbound from the NAS or outbound from GitHub
 Actions:
 
 - NAS to GitHub: issues, labels, dispatch.
-- NAS to S3: diagnostic summary upload.
+- NAS to S3: incident-time diagnostic summary upload.
 - NAS to `homelab-functions`: notification request.
 - GitHub Actions to S3: diagnostic summary download.
 
