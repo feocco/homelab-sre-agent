@@ -9,7 +9,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-      issues: read
+      issues: write
     # Replace this placeholder with a release tag or commit SHA that includes
     # the diagnostic_url input. Do not use @main for production callers.
     uses: feocco/homelab-sre-agent/.github/workflows/homelab-sre-codex.yml@<pinned-release-or-commit-sha>

@@ -9,7 +9,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-      issues: read
+      issues: write
     uses: ./.github/workflows/homelab-sre-codex.yml
     with:
       issue_number: ${{ github.event.client_payload.issue_number }}

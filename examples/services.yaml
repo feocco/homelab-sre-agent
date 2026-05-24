@@ -24,7 +24,7 @@ services:
       # Eligible for approved autofix. The SRE agent still waits for the
       # sre:autofix-approved issue label before dispatching Codex.
       autofix: false
-      repo_daily_limit: 1
+      repo_daily_limit: 5
       # Optional: route obvious dependency outages to phone notification +
       # local recurrence state instead of creating a source-repo issue.
       routing:

@@ -46,7 +46,7 @@ SRE_DOCKER_LOG_TAIL=200
 SRE_INVESTIGATION_COOLDOWN_SECONDS=86400
 SRE_ISSUE_COMMENT_COOLDOWN_SECONDS=3600
 SRE_OPERATIONAL_NOTIFICATION_COOLDOWN_SECONDS=3600
-SRE_CODEX_GLOBAL_DAILY_LIMIT=3
+SRE_CODEX_GLOBAL_DAILY_LIMIT=5
 SRE_APPROVAL_POLL_SECONDS=120
 SRE_ISSUE_NOTIFICATIONS_ENABLED=true
 SRE_PHONE_APPROVALS_ENABLED=true
@@ -122,3 +122,37 @@ services:
 Rules are matched against the representative log line before issue creation.
 Use them for clear downstream/service-unavailable cases, not for unknown
 exceptions that need source-code investigation.
+
+## Updating Routing Metadata
+
+When a source-repo SRE issue turns out to be operational noise, the fix usually
+belongs in private `homelab-config` metadata, not in the app repo that happened
+to log the downstream error.
+
+Use this path:
+
+1. Confirm the incident is a dependency or platform symptom, such as a known
+   upstream service being unavailable, DNS temporarily failing, or a connection
+   timeout that already has retry/backoff.
+2. Do not add source code that only hides the symptom unless the app is logging
+   at the wrong level or mishandling retries.
+3. Add a narrow `sre.routing.operational_dependencies` rule for the affected
+   service in `homelab-config`.
+4. Keep the `pattern` specific enough that unrelated exceptions still become
+   code-fix issues.
+
+If Codex is running in the source repo and determines that routing metadata is
+the right change, it should report the exact YAML to add in `homelab-config`
+instead of opening a source-repo PR that only suppresses the error.
+
+The reviewed Auto-PR path uses two labels:
+
+- `sre:metadata-suggested`: Codex found an operational route and posted exact
+  YAML in the source issue.
+- `sre:metadata-approved`: a human approved opening a `homelab-config` PR from
+  the suggested YAML.
+
+The metadata workflow can also be run manually with an issue repo and issue
+number. It validates the suggestion, updates only the matching service in
+`services/homelab-sre-agent/services.yaml`, skips duplicate rules, and opens a
+reviewed `homelab-config` PR. It does not push directly to `main`.
