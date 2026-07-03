@@ -30,6 +30,9 @@ repo documents the contract and examples only:
 Authorization uses `Authorization: Bearer <SRE_INCIDENT_TOKEN>` when a token is
 configured.
 
+`GET /docs` serves browser-friendly API notes for the public HTTP surface, and
+`GET /openapi.json` serves the matching OpenAPI 3.1 schema.
+
 ## Incident Dashboard
 
 `GET /incidents` serves a small read-only dashboard over the local SQLite state.
@@ -70,4 +73,10 @@ Dashboard:
 
 ```bash
 open http://localhost:8094/incidents
+```
+
+Service docs:
+
+```bash
+open http://localhost:8094/docs
 ```

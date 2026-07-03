@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 from datetime import datetime, timedelta, timezone
+import json
 import os
 from pathlib import Path
 import re
@@ -10,6 +11,8 @@ import tempfile
 import time
 from unittest import TestCase
 from unittest.mock import patch
+from http.server import ThreadingHTTPServer
+from urllib.request import urlopen
 
 from homelab_sre_agent.config import Config
 from homelab_sre_agent.docker_logs import DockerLogCollector
@@ -21,6 +24,7 @@ from homelab_sre_agent.notifications import (
     IssueNotifier,
 )
 from homelab_sre_agent.redact import redact_text
+from homelab_sre_agent.server import SREServer
 from homelab_sre_agent.service import (
     AUTOFIX_APPROVED_LABEL,
     AUTOFIX_BLOCKED_LABEL,
@@ -239,6 +243,77 @@ def payload(container: str = "plant-monitor", fingerprint: str = "abc123def456")
             "occurred_at": "2026-05-09T05:00:00+00:00",
         },
     }
+
+
+class ServerTests(TestCase):
+    def make_service(self):
+        tmp = tempfile.TemporaryDirectory()
+        path = Path(tmp.name)
+        (path / "services.yaml").write_text(
+            """
+services:
+  plant-monitor:
+    containers: [plant-monitor]
+    source:
+      repo: feocco/plant-monitor
+    sre:
+      enabled: true
+      autofix: true
+""",
+            encoding="utf-8",
+        )
+        config = make_config(path)
+        catalog = load_catalog(config.service_metadata_path, default_issue_repo=config.default_issue_repo)
+        service = SREService(
+            config=config,
+            catalog=catalog,
+            state=StateStore(config.state_path),
+            github=FakeGitHub(),
+            logs=FakeLogs("ERROR failed"),
+        )
+        return tmp, config, service
+
+    def start_server(self):
+        tmp, config, service = self.make_service()
+        server = SREServer(config=config, service=service)
+        httpd = server.httpd = ThreadingHTTPServer(
+            (config.service_host, 0),
+            server._handler(),
+        )
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(httpd.shutdown)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(thread.join, 1)
+        self.addCleanup(tmp.cleanup)
+        return f"http://{config.service_host}:{httpd.server_address[1]}"
+
+    def test_docs_route_returns_html_with_endpoint_summary(self) -> None:
+        base_url = self.start_server()
+
+        with urlopen(f"{base_url}/docs", timeout=5) as response:
+            body = response.read().decode("utf-8")
+
+        self.assertEqual(response.status, 200)
+        self.assertIn("text/html", response.headers.get("Content-Type", ""))
+        self.assertIn("/openapi.json", body)
+        self.assertIn("/v1/incidents", body)
+        self.assertIn("Authorization: Bearer", body)
+        self.assertIn("repository_dispatch", body)
+
+    def test_openapi_route_returns_openapi_31_json(self) -> None:
+        base_url = self.start_server()
+
+        with urlopen(f"{base_url}/openapi.json", timeout=5) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+
+        self.assertEqual(response.status, 200)
+        self.assertIn("json", response.headers.get("Content-Type", ""))
+        self.assertEqual(payload["openapi"], "3.1.0")
+        self.assertIn({"bearerAuth": []}, payload["paths"]["/v1/incidents"]["post"]["security"])
+        self.assertIn("when SRE_INCIDENT_TOKEN is configured", payload["paths"]["/v1/incidents"]["post"]["description"])
+        self.assertIn("/health", payload["paths"])
+        self.assertIn("/incidents", payload["paths"])
 
 
 class MetadataTests(TestCase):
