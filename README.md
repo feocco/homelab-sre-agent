@@ -30,6 +30,14 @@ repo documents the contract and examples only:
 Authorization uses `Authorization: Bearer <SRE_INCIDENT_TOKEN>` when a token is
 configured.
 
+## Incident Dashboard
+
+`GET /incidents` serves a small read-only dashboard over the local SQLite state.
+It shows incident families, operational/downstream families, observation counts,
+linked GitHub issues, approval tokens, dispatch history, and best-effort PR
+state. It does not approve autofix, retry dispatches, create issues, or change
+the incident pipeline.
+
 ## Metadata
 
 Private deployment metadata belongs in `homelab-config`, not this public app
@@ -56,4 +64,10 @@ Health check:
 
 ```bash
 curl http://localhost:8094/health
+```
+
+Dashboard:
+
+```bash
+open http://localhost:8094/incidents
 ```

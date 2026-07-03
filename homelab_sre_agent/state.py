@@ -103,6 +103,69 @@ class OperationalIncidentRecord:
     notification_count: int
 
 
+@dataclass(frozen=True)
+class DashboardFamilySummary:
+    family_type: str
+    fingerprint: str
+    service_name: str
+    issue_repo: str
+    issue_number: int | None
+    issue_url: str | None
+    count: int
+    first_seen_at: str
+    last_seen_at: str
+    last_24h_count: int | None
+    last_7d_count: int | None
+    last_14d_count: int | None
+    source_fingerprint_count: int | None
+    severity: str | None
+    latest_line: str
+    latest_diagnostic_reference: str | None
+    dependency: str | None
+    reason: str | None
+    notification_count: int
+    dispatch_count: int
+    last_dispatch_at: str | None
+    approval_token_count: int
+    used_approval_token_count: int
+
+
+@dataclass(frozen=True)
+class DashboardObservation:
+    observed_at: str
+    severity: str
+    source_fingerprint: str
+    representative_line: str
+    diagnostic_reference: str
+
+
+@dataclass(frozen=True)
+class DashboardDispatch:
+    id: int
+    source_repo: str
+    service_name: str
+    fingerprint: str
+    created_at: str
+
+
+@dataclass(frozen=True)
+class DashboardApproval:
+    service_name: str
+    issue_repo: str
+    issue_number: int
+    issue_url: str
+    created_at: str
+    used_at: str | None
+
+
+@dataclass(frozen=True)
+class DashboardFamilyDetail:
+    summary: DashboardFamilySummary
+    observations: tuple[DashboardObservation, ...]
+    dispatches: tuple[DashboardDispatch, ...]
+    approvals: tuple[DashboardApproval, ...]
+
+
 class StateStore:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -689,6 +752,121 @@ class StateStore:
             self.connection.commit()
             return phone_approval_token_from_row(row)
 
+    def list_dashboard_families(
+        self,
+        *,
+        family_type: str = "all",
+        service_name: str | None = None,
+        since: datetime | None = None,
+        limit: int = 100,
+        now: datetime | None = None,
+    ) -> list[DashboardFamilySummary]:
+        now = now or utc_now()
+        family_type = normalized_family_type(family_type)
+        limit = max(1, min(limit, 500))
+        summaries: list[DashboardFamilySummary] = []
+        with self._lock:
+            if family_type in {"all", "incident"}:
+                summaries.extend(
+                    incident_summary_from_row(row)
+                    for row in self.connection.execute(
+                        INCIDENT_DASHBOARD_QUERY,
+                        dashboard_window_params(now),
+                    ).fetchall()
+                )
+            if family_type in {"all", "operational"}:
+                summaries.extend(
+                    operational_summary_from_row(row)
+                    for row in self.connection.execute(OPERATIONAL_DASHBOARD_QUERY).fetchall()
+                )
+
+        filtered = [
+            item
+            for item in summaries
+            if (service_name is None or item.service_name == service_name)
+            and (since is None or dashboard_seen_at(item) is None or dashboard_seen_at(item) >= since)
+        ]
+        filtered.sort(key=lambda item: item.last_seen_at, reverse=True)
+        return filtered[:limit]
+
+    def get_dashboard_family(
+        self,
+        *,
+        family_type: str,
+        fingerprint: str,
+        now: datetime | None = None,
+        observation_limit: int = 25,
+    ) -> DashboardFamilyDetail | None:
+        now = now or utc_now()
+        family_type = normalized_family_type(family_type)
+        observation_limit = max(1, min(observation_limit, 100))
+        if family_type == "all":
+            return None
+
+        with self._lock:
+            if family_type == "incident":
+                row = self.connection.execute(
+                    f"{INCIDENT_DASHBOARD_QUERY} HAVING i.fingerprint = ?",
+                    (*dashboard_window_params(now), fingerprint),
+                ).fetchone()
+                if row is None:
+                    return None
+                summary = incident_summary_from_row(row)
+                observation_rows = self.connection.execute(
+                    """
+                    SELECT observed_at, severity, source_fingerprint, representative_line, diagnostic_reference
+                    FROM incident_observations
+                    WHERE fingerprint = ?
+                    ORDER BY observed_at DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (fingerprint, observation_limit),
+                ).fetchall()
+                observations = tuple(dashboard_observation_from_row(item) for item in observation_rows)
+            else:
+                row = self.connection.execute(
+                    f"{OPERATIONAL_DASHBOARD_QUERY} WHERE fingerprint = ?",
+                    (fingerprint,),
+                ).fetchone()
+                if row is None:
+                    return None
+                summary = operational_summary_from_row(row)
+                observations = (
+                    DashboardObservation(
+                        observed_at=summary.last_seen_at,
+                        severity="operational",
+                        source_fingerprint=summary.fingerprint,
+                        representative_line=summary.latest_line,
+                        diagnostic_reference=summary.latest_diagnostic_reference or "",
+                    ),
+                )
+
+            dispatch_rows = self.connection.execute(
+                """
+                SELECT id, source_repo, service_name, fingerprint, created_at
+                FROM dispatches
+                WHERE fingerprint = ?
+                ORDER BY created_at DESC, id DESC
+                """,
+                (fingerprint,),
+            ).fetchall()
+            approval_rows = self.connection.execute(
+                """
+                SELECT service_name, issue_repo, issue_number, issue_url, created_at, used_at
+                FROM phone_approval_tokens
+                WHERE fingerprint = ?
+                ORDER BY created_at DESC
+                """,
+                (fingerprint,),
+            ).fetchall()
+
+        return DashboardFamilyDetail(
+            summary=summary,
+            observations=observations,
+            dispatches=tuple(dashboard_dispatch_from_row(item) for item in dispatch_rows),
+            approvals=tuple(dashboard_approval_from_row(item) for item in approval_rows),
+        )
+
 
 def incident_from_row(row: sqlite3.Row | None) -> IncidentRecord | None:
     if row is None:
@@ -750,4 +928,179 @@ def phone_approval_token_from_row(row: sqlite3.Row) -> PhoneApprovalToken:
         issue_number=int(row["issue_number"]),
         issue_url=str(row["issue_url"]),
         created_at=str(row["created_at"]),
+    )
+
+
+INCIDENT_DASHBOARD_QUERY = """
+SELECT
+  i.*,
+  COUNT(o.id) AS observation_count,
+  COUNT(DISTINCT o.source_fingerprint) AS source_fingerprint_count,
+  SUM(CASE WHEN o.observed_at >= ? THEN 1 ELSE 0 END) AS last_24h_count,
+  SUM(CASE WHEN o.observed_at >= ? THEN 1 ELSE 0 END) AS last_7d_count,
+  SUM(CASE WHEN o.observed_at >= ? THEN 1 ELSE 0 END) AS last_14d_count,
+  COALESCE(MIN(o.observed_at), i.first_seen_at) AS dashboard_first_seen_at,
+  COALESCE(MAX(o.observed_at), i.last_seen_at) AS dashboard_last_seen_at,
+  (
+    SELECT severity
+    FROM incident_observations latest
+    WHERE latest.fingerprint = i.fingerprint
+    ORDER BY latest.observed_at DESC, latest.id DESC
+    LIMIT 1
+  ) AS latest_severity,
+  (
+    SELECT representative_line
+    FROM incident_observations latest
+    WHERE latest.fingerprint = i.fingerprint
+    ORDER BY latest.observed_at DESC, latest.id DESC
+    LIMIT 1
+  ) AS latest_line,
+  (
+    SELECT diagnostic_reference
+    FROM incident_observations latest
+    WHERE latest.fingerprint = i.fingerprint
+    ORDER BY latest.observed_at DESC, latest.id DESC
+    LIMIT 1
+  ) AS latest_observation_diagnostic_reference,
+  (
+    SELECT COUNT(*)
+    FROM dispatches d
+    WHERE d.fingerprint = i.fingerprint
+  ) AS dispatch_count,
+  (
+    SELECT MAX(created_at)
+    FROM dispatches d
+    WHERE d.fingerprint = i.fingerprint
+  ) AS last_dispatch_at,
+  (
+    SELECT COUNT(*)
+    FROM phone_approval_tokens token
+    WHERE token.fingerprint = i.fingerprint
+  ) AS approval_token_count,
+  (
+    SELECT COUNT(*)
+    FROM phone_approval_tokens token
+    WHERE token.fingerprint = i.fingerprint AND token.used_at IS NOT NULL
+  ) AS used_approval_token_count
+FROM incidents i
+LEFT JOIN incident_observations o ON o.fingerprint = i.fingerprint
+GROUP BY i.fingerprint
+"""
+
+OPERATIONAL_DASHBOARD_QUERY = """
+SELECT
+  *,
+  0 AS dispatch_count,
+  NULL AS last_dispatch_at,
+  0 AS approval_token_count,
+  0 AS used_approval_token_count
+FROM operational_incidents
+"""
+
+
+def dashboard_window_params(now: datetime) -> tuple[str, str, str]:
+    return (
+        format_dt(now - timedelta(hours=24)),
+        format_dt(now - timedelta(days=7)),
+        format_dt(now - timedelta(days=14)),
+    )
+
+
+def normalized_family_type(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized in {"incident", "operational"}:
+        return normalized
+    return "all"
+
+
+def dashboard_seen_at(summary: DashboardFamilySummary) -> datetime | None:
+    return parse_dt(summary.last_seen_at)
+
+
+def incident_summary_from_row(row: sqlite3.Row) -> DashboardFamilySummary:
+    observation_count = int(row["observation_count"] or 0)
+    return DashboardFamilySummary(
+        family_type="incident",
+        fingerprint=str(row["fingerprint"]),
+        service_name=str(row["service_name"]),
+        issue_repo=str(row["issue_repo"]),
+        issue_number=int(row["issue_number"]) if row["issue_number"] is not None else None,
+        issue_url=str(row["issue_url"]) if row["issue_url"] else None,
+        count=observation_count if observation_count > 0 else int(row["count"] or 0),
+        first_seen_at=str(row["dashboard_first_seen_at"]),
+        last_seen_at=str(row["dashboard_last_seen_at"]),
+        last_24h_count=int(row["last_24h_count"] or 0),
+        last_7d_count=int(row["last_7d_count"] or 0),
+        last_14d_count=int(row["last_14d_count"] or 0),
+        source_fingerprint_count=int(row["source_fingerprint_count"] or 0),
+        severity=str(row["latest_severity"]) if row["latest_severity"] else None,
+        latest_line=str(row["latest_line"] or ""),
+        latest_diagnostic_reference=str(row["latest_observation_diagnostic_reference"] or row["latest_diagnostic_reference"] or "")
+        or None,
+        dependency=None,
+        reason=None,
+        notification_count=0,
+        dispatch_count=int(row["dispatch_count"] or 0),
+        last_dispatch_at=str(row["last_dispatch_at"]) if row["last_dispatch_at"] else None,
+        approval_token_count=int(row["approval_token_count"] or 0),
+        used_approval_token_count=int(row["used_approval_token_count"] or 0),
+    )
+
+
+def operational_summary_from_row(row: sqlite3.Row) -> DashboardFamilySummary:
+    return DashboardFamilySummary(
+        family_type="operational",
+        fingerprint=str(row["fingerprint"]),
+        service_name=str(row["service_name"]),
+        issue_repo=str(row["issue_repo"]),
+        issue_number=None,
+        issue_url=None,
+        count=int(row["total_count"]),
+        first_seen_at=str(row["first_seen_at"]),
+        last_seen_at=str(row["latest_seen_at"]),
+        last_24h_count=None,
+        last_7d_count=None,
+        last_14d_count=None,
+        source_fingerprint_count=None,
+        severity="operational",
+        latest_line=str(row["latest_line"]),
+        latest_diagnostic_reference=str(row["latest_diagnostic_reference"]),
+        dependency=str(row["dependency"]),
+        reason=str(row["reason"]),
+        notification_count=int(row["notification_count"] or 0),
+        dispatch_count=int(row["dispatch_count"] or 0),
+        last_dispatch_at=str(row["last_dispatch_at"]) if row["last_dispatch_at"] else None,
+        approval_token_count=int(row["approval_token_count"] or 0),
+        used_approval_token_count=int(row["used_approval_token_count"] or 0),
+    )
+
+
+def dashboard_observation_from_row(row: sqlite3.Row) -> DashboardObservation:
+    return DashboardObservation(
+        observed_at=str(row["observed_at"]),
+        severity=str(row["severity"]),
+        source_fingerprint=str(row["source_fingerprint"]),
+        representative_line=str(row["representative_line"]),
+        diagnostic_reference=str(row["diagnostic_reference"]),
+    )
+
+
+def dashboard_dispatch_from_row(row: sqlite3.Row) -> DashboardDispatch:
+    return DashboardDispatch(
+        id=int(row["id"]),
+        source_repo=str(row["source_repo"]),
+        service_name=str(row["service_name"]),
+        fingerprint=str(row["fingerprint"]),
+        created_at=str(row["created_at"]),
+    )
+
+
+def dashboard_approval_from_row(row: sqlite3.Row) -> DashboardApproval:
+    return DashboardApproval(
+        service_name=str(row["service_name"]),
+        issue_repo=str(row["issue_repo"]),
+        issue_number=int(row["issue_number"]),
+        issue_url=str(row["issue_url"]),
+        created_at=str(row["created_at"]),
+        used_at=str(row["used_at"]) if row["used_at"] else None,
     )

@@ -14,6 +14,12 @@ local NAS diagnostic bundle and recurrence state, but it does not create a
 GitHub issue or publish an S3 handoff. Those events send cooldown-controlled
 phone notifications only.
 
+The `/incidents` dashboard reads local SQLite state and shows redacted
+representative lines, diagnostic references, GitHub issue links, approval token
+status, and dispatch history. It does not expose full NAS diagnostic bundles and
+does not sign S3 URLs. Keep the dashboard on the private homelab route, not a
+public Cloudflare path.
+
 For code-fix candidate incidents, the SRE agent uploads a bounded diagnostic
 summary to private S3 when it creates or updates the GitHub issue. It stores the
 S3 object key in local SQLite state, not a long-lived URL.

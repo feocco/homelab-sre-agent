@@ -12,6 +12,8 @@ flowchart LR
     watcher -- "incident webhook" --> sre["homelab-sre-agent pod"]
 
     sre --> state["SQLite state\nincidents, recurrence,\ncomments, dispatches"]
+    dashboard["Read-only incident dashboard"] --> state
+    dashboard -- "best-effort issue/PR lookup" --> github
     sre --> localdiag["NAS diagnostic bundles\nfull local logs"]
     sre --> route{"code-fix or\noperational?"}
     route -- "code-fix candidate" --> github
@@ -63,6 +65,11 @@ Owns incident coordination:
   updated.
 - On approval, signs the stored diagnostic object and dispatches the Codex
   workflow.
+- Serves a read-only `/incidents` dashboard over local SQLite state and
+  best-effort GitHub issue/PR lookups.
+
+The dashboard is an inspection lens. It does not create issues, approve
+autofix, retry dispatches, edit routing metadata, or own project management.
 
 ### `homelab-functions` / Home Assistant
 
