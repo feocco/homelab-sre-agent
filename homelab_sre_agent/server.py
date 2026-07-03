@@ -10,6 +10,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .config import Config
+from .dashboard import render_family_from_state, render_index_from_state
 from .service import SREService
 
 
@@ -36,8 +37,23 @@ class SREServer:
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:
-                if urlsplit(self.path).path == "/health":
+                parsed = urlsplit(self.path)
+                if parsed.path == "/health":
                     write_json(self, HTTPStatus.OK, {"ok": True, "dry_run": config.dry_run})
+                    return
+                if parsed.path == "/incidents":
+                    write_html(self, HTTPStatus.OK, render_index_from_state(service.state, parsed.query))
+                    return
+                if parsed.path == "/incidents/family":
+                    try:
+                        body = render_family_from_state(service.state, service.github, parsed.query)
+                    except ValueError as exc:
+                        write_html(self, HTTPStatus.BAD_REQUEST, error_page("Bad request", str(exc)))
+                        return
+                    if body is None:
+                        write_html(self, HTTPStatus.NOT_FOUND, error_page("Not found", "Incident family not found."))
+                        return
+                    write_html(self, HTTPStatus.OK, body)
                     return
                 write_json(self, HTTPStatus.NOT_FOUND, {"error": "not found"})
 
@@ -95,3 +111,21 @@ def write_json(handler: BaseHTTPRequestHandler, status: HTTPStatus, payload: dic
     handler.send_header("Content-Length", str(len(body)))
     handler.end_headers()
     handler.wfile.write(body)
+
+
+def write_html(handler: BaseHTTPRequestHandler, status: HTTPStatus, body: str) -> None:
+    encoded = body.encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", "text/html; charset=utf-8")
+    handler.send_header("Content-Length", str(len(encoded)))
+    handler.end_headers()
+    handler.wfile.write(encoded)
+
+
+def error_page(title: str, message: str) -> str:
+    return f"""<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>{title}</title></head>
+<body><h1>{title}</h1><p>{message}</p><p><a href="/incidents">incidents</a></p></body>
+</html>
+"""

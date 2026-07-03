@@ -29,6 +29,26 @@ class GitHubIssue:
     labels: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class GitHubIssueDetails:
+    repo: str
+    number: int
+    url: str
+    title: str
+    state: str
+    labels: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class GitHubPullRequest:
+    repo: str
+    number: int
+    url: str
+    title: str
+    state: str
+    branch: str
+
+
 class GitHubAppInstallationAuth:
     def __init__(
         self,
@@ -244,18 +264,65 @@ class GitHubClient:
         )
 
     def open_pull_request_exists(self, *, repo: str, branch: str) -> bool:
+        return self.find_pull_request_by_branch(repo=repo, branch=branch, state="open") is not None
+
+    def get_issue_details(self, *, repo: str, issue_number: int) -> GitHubIssueDetails | None:
         if self.dry_run:
-            return False
+            return None
+        response = self._request(
+            "GET",
+            f"/repos/{repo_path(repo)}/issues/{issue_number}",
+            None,
+            not_found_ok=True,
+        )
+        if response is None:
+            return None
+        if not isinstance(response, dict):
+            raise RuntimeError("GitHub API returned a non-object issue response")
+        if "pull_request" in response:
+            return None
+        labels = labels_from_issue_response(response)
+        return GitHubIssueDetails(
+            repo=repo,
+            number=int(response["number"]),
+            url=str(response["html_url"]),
+            title=str(response.get("title") or ""),
+            state=str(response.get("state") or "unknown"),
+            labels=labels,
+        )
+
+    def find_pull_request_by_branch(
+        self,
+        *,
+        repo: str,
+        branch: str,
+        state: str = "all",
+    ) -> GitHubPullRequest | None:
+        if self.dry_run:
+            return None
         owner, _ = repo.split("/", 1)
         head = quote(f"{owner}:{branch}", safe="")
         response = self._request(
             "GET",
-            f"/repos/{repo_path(repo)}/pulls?state=open&head={head}&per_page=1",
+            f"/repos/{repo_path(repo)}/pulls?state={quote(state, safe='')}&head={head}&per_page=1",
             None,
         )
         if not isinstance(response, list):
             raise RuntimeError("GitHub API returned a non-list pull request response")
-        return bool(response)
+        if not response:
+            return None
+        item = response[0]
+        if not isinstance(item, dict):
+            raise RuntimeError("GitHub API returned a malformed pull request response")
+        head_info = item.get("head") if isinstance(item.get("head"), dict) else {}
+        return GitHubPullRequest(
+            repo=repo,
+            number=int(item["number"]),
+            url=str(item["html_url"]),
+            title=str(item.get("title") or ""),
+            state=str(item.get("state") or "unknown"),
+            branch=str(head_info.get("ref") or branch),
+        )
 
     def _request(
         self,
@@ -345,3 +412,11 @@ def github_client_from_config(config: Config) -> GitHubClient:
 def repo_path(repo: str) -> str:
     owner, name = repo.split("/", 1)
     return f"{quote(owner, safe='')}/{quote(name, safe='')}"
+
+
+def labels_from_issue_response(item: dict[str, Any]) -> tuple[str, ...]:
+    return tuple(
+        str(label_item.get("name"))
+        for label_item in item.get("labels", [])
+        if isinstance(label_item, dict) and label_item.get("name")
+    )

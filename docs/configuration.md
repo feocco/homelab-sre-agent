@@ -32,6 +32,8 @@ The public app repo should keep only examples and the code contract.
 - Keeps Codex dispatch disabled unless service metadata sets `sre.autofix:
   true` and an issue receives the `sre:autofix-approved` label.
 - Polls GitHub for approved SRE issues every `SRE_APPROVAL_POLL_SECONDS`.
+- Serves a read-only incident dashboard at `/incidents` on the same HTTP
+  service. Keep this route on the private homelab path.
 
 ## Core Runtime Variables
 
@@ -60,6 +62,17 @@ SERVICE_HOST=0.0.0.0
 SERVICE_PORT=8094
 LOG_LEVEL=INFO
 ```
+
+## Dashboard Route
+
+The dashboard is built into the SRE agent and reads the same SQLite state as the
+incident coordinator. It is intentionally read-only: no approval, retry, issue
+creation, or routing metadata actions are exposed from the UI.
+
+Expose `/incidents` only through the private homelab route used for this
+service. Do not publish it as a public Cloudflare route; it contains redacted
+representative log lines, local diagnostic references, and GitHub issue
+metadata.
 
 ## Diagnostic Handoff Variables
 
