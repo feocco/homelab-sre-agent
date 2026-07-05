@@ -10,7 +10,7 @@ from urllib.error import HTTPError
 from urllib.request import urlopen
 
 from homelab_sre_agent.config import Config
-from homelab_sre_agent.dashboard import DashboardEnrichment, render_family_detail, render_family_from_state
+from homelab_sre_agent.dashboard import DashboardEnrichment, render_family_detail, render_family_from_state, render_index_from_state
 from homelab_sre_agent.docker_logs import DockerLogCollector
 from homelab_sre_agent.github import GitHubClient, GitHubIssueDetails, GitHubPullRequest
 from homelab_sre_agent.metadata import load_catalog
@@ -234,6 +234,25 @@ class DashboardStateTests(TestCase):
 
             self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", html)
             self.assertNotIn("<script>alert(1)</script>", html)
+
+    def test_dashboard_index_links_family_separately_from_service_filter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = StateStore(Path(tmp) / "state.sqlite3")
+            seed_dashboard_state(state)
+
+            html = render_index_from_state(state, "")
+
+            self.assertIn("<th>family</th><th>service</th>", html)
+            self.assertIn(
+                '<a class="family-link" href="/incidents/family?type=incident&amp;fingerprint=episode%3Aplant-monitor%3Afingerprint">ERROR &lt;script&gt;alert(1)&lt;/script&gt;</a>',
+                html,
+            )
+            self.assertIn('<a class="service-link" href="/incidents?service=plant-monitor">plant-monitor</a>', html)
+            self.assertNotIn(
+                '<a href="/incidents/family?type=incident&amp;fingerprint=episode%3Aplant-monitor%3Afingerprint">plant-monitor</a>',
+                html,
+            )
+            self.assertIn("homelab-functions operational dependency", html)
 
     def test_github_enrichment_unavailable_still_renders_family_detail(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -119,13 +119,13 @@ def render_index(families: list[DashboardFamilySummary], filters: DashboardFilte
         render_filters(filters),
         '<table class="families">',
         "<thead><tr>"
-        "<th>type</th><th>service</th><th>count</th><th>first seen</th><th>last seen</th>"
+        "<th>type</th><th>family</th><th>service</th><th>count</th><th>first seen</th><th>last seen</th>"
         "<th>issue/work item</th><th>dispatch</th><th>latest example</th>"
         "</tr></thead>",
         "<tbody>",
     ]
     if not families:
-        body.append('<tr><td colspan="8" class="empty">No families match the selected filters.</td></tr>')
+        body.append('<tr><td colspan="9" class="empty">No families match the selected filters.</td></tr>')
     for family in families:
         body.append(render_family_row(family))
     body.extend(["</tbody>", "</table>"])
@@ -134,13 +134,18 @@ def render_index(families: list[DashboardFamilySummary], filters: DashboardFilte
 
 def render_family_detail(detail: DashboardFamilyDetail, enrichment: DashboardEnrichment) -> str:
     family = detail.summary
+    title = family_name(family)
     body = [
         "<header>",
-        f"<h1>{esc(family.service_name)}</h1>",
+        "<div>",
+        f"<h1>{esc(title)}</h1>",
+        f'<p class="subhead">{service_filter_link(family.service_name)}</p>',
+        "</div>",
         '<a class="health" href="/incidents">incidents</a>',
         "</header>",
         '<section class="summary">',
         summary_card("type", family.family_type),
+        summary_card("service", family.service_name),
         summary_card("count", str(family.count)),
         summary_card("first seen", family.first_seen_at),
         summary_card("last seen", family.last_seen_at),
@@ -148,7 +153,7 @@ def render_family_detail(detail: DashboardFamilyDetail, enrichment: DashboardEnr
         '<section class="panel">',
         "<h2>Family</h2>",
         "<dl>",
-        f"<dt>fingerprint</dt><dd><code>{esc(family.fingerprint)}</code></dd>",
+        f"<dt>state key</dt><dd><code>{esc(family.fingerprint)}</code></dd>",
         f"<dt>severity</dt><dd>{esc(family.severity or 'n/a')}</dd>",
         f"<dt>dependency</dt><dd>{esc(family.dependency or 'n/a')}</dd>",
         f"<dt>reason</dt><dd>{esc(family.reason or 'n/a')}</dd>",
@@ -161,7 +166,7 @@ def render_family_detail(detail: DashboardFamilyDetail, enrichment: DashboardEnr
         render_approvals(detail),
         render_observations(detail),
     ]
-    return page(f"{family.service_name} SRE Family", "\n".join(body))
+    return page(f"{title} SRE Family", "\n".join(body))
 
 
 def enrich_family(detail: DashboardFamilyDetail, github: GitHubDashboardClient) -> DashboardEnrichment:
@@ -205,7 +210,8 @@ def render_family_row(family: DashboardFamilySummary) -> str:
     return (
         "<tr>"
         f"<td><span class=\"badge {esc(family.family_type)}\">{esc(family.family_type)}</span></td>"
-        f"<td><a href=\"{esc(url)}\">{esc(family.service_name)}</a></td>"
+        f"<td><a class=\"family-link\" href=\"{esc(url)}\">{esc(family_name(family))}</a></td>"
+        f"<td>{service_filter_link(family.service_name)}</td>"
         f"<td>{render_count(family)}</td>"
         f"<td>{esc(short_time(family.first_seen_at))}</td>"
         f"<td>{esc(short_time(family.last_seen_at))}</td>"
@@ -214,6 +220,28 @@ def render_family_row(family: DashboardFamilySummary) -> str:
         f"<td><code>{esc(truncate(family.latest_line, 180))}</code></td>"
         "</tr>"
     )
+
+
+def family_name(family: DashboardFamilySummary) -> str:
+    if family.family_type == "operational":
+        if family.dependency:
+            return f"{family.dependency} operational dependency"
+        return "Operational dependency"
+    line = compact_line(family.latest_line)
+    if line:
+        return truncate(line, 96)
+    if family.issue_number is not None:
+        return f"Issue #{family.issue_number}"
+    return f"{family.service_name} incident family"
+
+
+def service_filter_link(service_name: str) -> str:
+    url = "/incidents?" + urlencode({"service": service_name})
+    return f'<a class="service-link" href="{esc(url)}">{esc(service_name)}</a>'
+
+
+def compact_line(value: str) -> str:
+    return " ".join(value.split())
 
 
 def render_filters(filters: DashboardFilters) -> str:
@@ -448,6 +476,13 @@ def page(title: str, body: str) -> str:
     }}
     a:hover {{
       text-decoration: underline;
+    }}
+    .family-link {{
+      font-weight: 600;
+    }}
+    .subhead {{
+      margin: 4px 0 0;
+      color: var(--muted);
     }}
     .health {{
       color: var(--muted);
