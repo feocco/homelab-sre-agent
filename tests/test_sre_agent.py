@@ -759,7 +759,20 @@ services:
         self.assertEqual(len(dispatch_actions), 1)
         client_payload = dispatch_actions[0]["client_payload"]
         self.assertLessEqual(len(client_payload), 10)
-        self.assertEqual(len(client_payload), 9)
+        self.assertEqual(
+            set(client_payload),
+            {
+                "issue_number",
+                "issue_url",
+                "fingerprint",
+                "state_fingerprint",
+                "service_name",
+                "container_name",
+                "deployment_repo",
+                "deployment_path",
+                "diagnostic",
+            },
+        )
         diagnostic = client_payload["diagnostic"]
         self.assertEqual(
             diagnostic["url"],
