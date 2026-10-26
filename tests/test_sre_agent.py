@@ -422,6 +422,24 @@ class GitHubAppAuthTests(TestCase):
         self.assertEqual(auth.requests, ["jwt-1779000000", "jwt-1779003400"])
 
 
+class GitHubClientTests(TestCase):
+    def test_repository_dispatch_rejects_more_than_ten_payload_properties_in_dry_run(self) -> None:
+        github = GitHubClient(token=None, api_url="https://api.github.com", dry_run=True, timeout_seconds=10)
+        client_payload = {f"key_{index}": index for index in range(11)}
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "GitHub repository_dispatch client_payload allows at most 10 top-level properties",
+        ):
+            github.repository_dispatch(
+                repo="feocco/plant-monitor",
+                event_type="homelab-sre-investigate",
+                client_payload=client_payload,
+            )
+
+        self.assertEqual(github.dry_run_actions, [])
+
+
 class ServiceTests(TestCase):
     def make_service(
         self,
@@ -740,13 +758,16 @@ services:
         dispatch_actions = [action for action in github.dry_run_actions if action["action"] == "repository_dispatch"]
         self.assertEqual(len(dispatch_actions), 1)
         client_payload = dispatch_actions[0]["client_payload"]
+        self.assertLessEqual(len(client_payload), 10)
+        self.assertEqual(len(client_payload), 9)
+        diagnostic = client_payload["diagnostic"]
         self.assertEqual(
-            client_payload["diagnostic_url"],
+            diagnostic["url"],
             f"https://diagnostics.example/{publisher.uploads[0][5]}?signature=short-lived",
         )
-        self.assertEqual(client_payload["diagnostic_reference"].startswith("/nas/diagnostics/plant-monitor/"), True)
-        self.assertEqual(client_payload["diagnostic_uploaded_at"], "2026-05-09T05:00:00+00:00")
-        self.assertEqual(client_payload["diagnostic_expires_at"], "2026-05-23T05:00:00+00:00")
+        self.assertTrue(diagnostic["reference"].startswith("/nas/diagnostics/plant-monitor/"))
+        self.assertEqual(diagnostic["diagnostic_uploaded_at"], "2026-05-09T05:00:00+00:00")
+        self.assertEqual(diagnostic["diagnostic_expires_at"], "2026-05-23T05:00:00+00:00")
         self.assertEqual(publisher.urls, [publisher.uploads[0][5]])
 
     def test_diagnostic_upload_failure_does_not_block_issue_or_dispatch(self) -> None:
@@ -778,8 +799,7 @@ services:
         dispatch_actions = [action for action in github.dry_run_actions if action["action"] == "repository_dispatch"]
         self.assertEqual(len(dispatch_actions), 1)
         client_payload = dispatch_actions[0]["client_payload"]
-        self.assertNotIn("diagnostic_url", client_payload)
-        self.assertNotIn("diagnostic_reference", client_payload)
+        self.assertNotIn("diagnostic", client_payload)
 
     def test_new_issue_sends_phone_notification_with_approval_button(self) -> None:
         github = FakeGitHub()
