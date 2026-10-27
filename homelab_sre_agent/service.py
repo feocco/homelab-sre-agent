@@ -505,9 +505,11 @@ class SREService:
             object_key = record.latest_diagnostic_object_key or ""
             if reference and object_key:
                 try:
-                    payload["diagnostic_url"] = self.diagnostic_publisher.presign(object_key)
-                    payload["diagnostic_reference"] = reference
-                    payload.update(self._diagnostic_retention_payload(record))
+                    payload["diagnostic"] = {
+                        "url": self.diagnostic_publisher.presign(object_key),
+                        "reference": reference,
+                        **self._diagnostic_retention_payload(record),
+                    }
                 except Exception:
                     LOGGER.exception("Could not publish diagnostic context for %s", state_key)
         self.github.repository_dispatch(

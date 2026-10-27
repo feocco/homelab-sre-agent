@@ -175,6 +175,8 @@ class GitHubClient:
         return None
 
     def repository_dispatch(self, *, repo: str, event_type: str, client_payload: dict[str, Any]) -> None:
+        if len(client_payload) > 10:
+            raise ValueError("GitHub repository_dispatch client_payload allows at most 10 top-level properties")
         if self.dry_run:
             self.dry_run_actions.append(
                 {
