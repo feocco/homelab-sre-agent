@@ -12,7 +12,8 @@ import time
 from unittest import TestCase
 from unittest.mock import patch
 from http.server import ThreadingHTTPServer
-from urllib.request import urlopen
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 from homelab_sre_agent.config import Config
 from homelab_sre_agent.docker_logs import DockerLogCollector
@@ -273,8 +274,11 @@ services:
         )
         return tmp, config, service
 
-    def start_server(self):
+    def start_server(self, *, catalog_loader=None):
         tmp, config, service = self.make_service()
+        if catalog_loader is not None:
+            service.catalog = None
+            service.catalog_loader = catalog_loader
         server = SREServer(config=config, service=service)
         httpd = server.httpd = ThreadingHTTPServer(
             (config.service_host, 0),
@@ -312,8 +316,57 @@ services:
         self.assertEqual(payload["openapi"], "3.1.0")
         self.assertIn({"bearerAuth": []}, payload["paths"]["/v1/incidents"]["post"]["security"])
         self.assertIn("when SRE_INCIDENT_TOKEN is configured", payload["paths"]["/v1/incidents"]["post"]["description"])
+        self.assertIn("422", payload["paths"]["/v1/incidents"]["post"]["responses"])
         self.assertIn("/health", payload["paths"])
         self.assertIn("/incidents", payload["paths"])
+
+    def test_incident_route_returns_422_for_unprocessable_bodies(self) -> None:
+        base_url = self.start_server()
+        cases = (
+            (b'{"incident":', "Expecting value"),
+            (b'{"version": 1}', "payload.incident must be an object"),
+        )
+
+        for body, expected_error in cases:
+            with self.subTest(body=body):
+                request = Request(
+                    f"{base_url}/v1/incidents",
+                    data=body,
+                    method="POST",
+                    headers={
+                        "Authorization": "Bearer secret",
+                        "Content-Type": "application/json",
+                    },
+                )
+                with self.assertRaises(HTTPError) as raised:
+                    urlopen(request, timeout=5)
+                error = json.loads(raised.exception.read().decode("utf-8"))
+
+                self.assertEqual(raised.exception.code, 422)
+                self.assertIn(expected_error, error["error"])
+
+    def test_incident_route_hides_internal_value_errors_as_500(self) -> None:
+        def failing_catalog_loader():
+            raise ValueError("internal catalog failure")
+
+        base_url = self.start_server(catalog_loader=failing_catalog_loader)
+        request = Request(
+            f"{base_url}/v1/incidents",
+            data=json.dumps(payload()).encode("utf-8"),
+            method="POST",
+            headers={
+                "Authorization": "Bearer secret",
+                "Content-Type": "application/json",
+            },
+        )
+
+        with self.assertRaises(HTTPError) as raised:
+            urlopen(request, timeout=5)
+        error = json.loads(raised.exception.read().decode("utf-8"))
+
+        self.assertEqual(raised.exception.code, 500)
+        self.assertEqual(error, {"error": "incident handling failed"})
+        self.assertNotIn("internal catalog failure", json.dumps(error))
 
 
 class MetadataTests(TestCase):
