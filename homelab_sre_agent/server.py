@@ -12,11 +12,15 @@ from urllib.parse import urlsplit
 
 from .config import Config
 from .dashboard import render_family_from_state, render_index_from_state
-from .service import SREService
+from .service import IncidentPayloadError, SREService
 
 
 LOGGER = logging.getLogger("homelab-sre-agent.server")
 MAX_BODY_BYTES = 256 * 1024
+
+
+class RequestBodyError(ValueError):
+    pass
 
 
 class SREServer:
@@ -74,8 +78,8 @@ class SREServer:
                 try:
                     payload = read_json_body(self)
                     result = service.handle_incident(payload)
-                except ValueError as exc:
-                    write_json(self, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                except (RequestBodyError, IncidentPayloadError) as exc:
+                    write_json(self, HTTPStatus.UNPROCESSABLE_ENTITY, {"error": str(exc)})
                     return
                 except Exception:
                     LOGGER.exception("Incident handling failed")
@@ -99,15 +103,21 @@ def authorized(header: str | None, expected: str) -> bool:
 
 
 def read_json_body(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
-    length = int(handler.headers.get("Content-Length") or "0")
+    try:
+        length = int(handler.headers.get("Content-Length") or "0")
+    except ValueError as exc:
+        raise RequestBodyError("invalid Content-Length header") from exc
     if length <= 0:
-        raise ValueError("empty request body")
+        raise RequestBodyError("empty request body")
     if length > MAX_BODY_BYTES:
-        raise ValueError("request body too large")
+        raise RequestBodyError("request body too large")
     raw = handler.rfile.read(length)
-    payload = json.loads(raw.decode("utf-8"))
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RequestBodyError(str(exc)) from exc
     if not isinstance(payload, dict):
-        raise ValueError("request body must be a JSON object")
+        raise RequestBodyError("request body must be a JSON object")
     return payload
 
 
@@ -400,8 +410,8 @@ def openapi_document() -> dict[str, Any]:
                             "description": "Incident processed, ignored, or reused successfully.",
                             "content": {"application/json": {"schema": {"type": "object"}}},
                         },
-                        "400": {
-                            "description": "Invalid JSON or missing required incident fields.",
+                        "422": {
+                            "description": "Invalid JSON or an incident payload that cannot be processed.",
                             "content": {
                                 "application/json": {
                                     "schema": {"$ref": "#/components/schemas/ErrorResponse"}

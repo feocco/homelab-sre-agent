@@ -36,6 +36,10 @@ AUTOFIX_LABELS = {
 }
 
 
+class IncidentPayloadError(ValueError):
+    pass
+
+
 class DiagnosticPublisher(Protocol):
     def upload(
         self,
@@ -68,13 +72,13 @@ class Incident:
     def from_payload(cls, payload: dict[str, Any]) -> "Incident":
         incident = payload.get("incident")
         if not isinstance(incident, dict):
-            raise ValueError("payload.incident must be an object")
+            raise IncidentPayloadError("payload.incident must be an object")
         container_name = str(incident.get("container_name") or "").strip()
         fingerprint = str(incident.get("fingerprint") or "").strip()
         if not container_name:
-            raise ValueError("incident.container_name is required")
+            raise IncidentPayloadError("incident.container_name is required")
         if not fingerprint:
-            raise ValueError("incident.fingerprint is required")
+            raise IncidentPayloadError("incident.fingerprint is required")
         return cls(
             container_id=optional_str(incident.get("container_id")),
             container_name=container_name,

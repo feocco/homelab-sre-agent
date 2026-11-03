@@ -11,7 +11,6 @@ from urllib.request import urlopen
 
 from homelab_sre_agent.config import Config
 from homelab_sre_agent.dashboard import DashboardEnrichment, render_family_detail, render_family_from_state, render_index_from_state
-from homelab_sre_agent.docker_logs import DockerLogCollector
 from homelab_sre_agent.github import GitHubClient, GitHubIssueDetails, GitHubPullRequest
 from homelab_sre_agent.metadata import load_catalog
 from homelab_sre_agent.server import SREServer
@@ -22,7 +21,7 @@ from homelab_sre_agent.state import StateStore
 NOW = datetime(2026, 5, 9, 5, 0, tzinfo=timezone.utc)
 
 
-class FakeLogs(DockerLogCollector):
+class FakeLogs:
     def collect_many(self, **kwargs) -> str:
         return "ERROR failed"
 
